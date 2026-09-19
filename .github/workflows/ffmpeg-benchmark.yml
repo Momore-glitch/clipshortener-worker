@@ -9,6 +9,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Check runner
         run: |
           echo "CPU:"
@@ -19,6 +24,9 @@ jobs:
 
           echo "FFmpeg:"
           ffmpeg -version | head -1
+
+          echo "FFprobe:"
+          ffprobe -version | head -1
 
       - name: Generate test video
         run: |
