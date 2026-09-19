@@ -1,0 +1,62 @@
+name: FFmpeg Benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check runner
+        run: |
+          echo "CPU:"
+          nproc
+
+          echo "Memory:"
+          free -h
+
+          echo "FFmpeg:"
+          ffmpeg -version | head -1
+
+      - name: Generate test video
+        run: |
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi \
+            -i testsrc2=size=1920x1080:rate=30 \
+            -t 60 \
+            -c:v libx264 \
+            -preset ultrafast \
+            -crf 23 \
+            -pix_fmt yuv420p \
+            test-source.mp4
+
+      - name: Benchmark ClipShortener-style processing
+        run: |
+          mkdir -p output
+
+          /usr/bin/time -v \
+          ffmpeg -hide_banner -y \
+            -i test-source.mp4 \
+            -vf "crop=ih*9/16:ih,scale=1080:1920:flags=fast_bilinear" \
+            -c:v libx264 \
+            -preset ultrafast \
+            -crf 23 \
+            -pix_fmt yuv420p \
+            -threads 4 \
+            -filter_threads 4 \
+            -an \
+            output/test.mp4
+
+      - name: Show result
+        run: |
+          echo "=== OUTPUT ==="
+          ls -lh output/test.mp4
+
+          echo "=== VIDEO INFO ==="
+          ffprobe -v error \
+            -show_entries format=duration,size \
+            -show_entries stream=width,height,r_frame_rate \
+            -of default=noprint_wrappers=1 \
+            output/test.mp4
