@@ -6,7 +6,7 @@ on:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Install FFmpeg
@@ -16,31 +16,28 @@ jobs:
 
       - name: Check runner
         run: |
-          echo "CPU:"
+          echo "=== CPU ==="
           nproc
 
-          echo "Memory:"
+          echo "=== MEMORY ==="
           free -h
 
-          echo "FFmpeg:"
+          echo "=== FFMPEG ==="
           ffmpeg -version | head -1
 
-          echo "FFprobe:"
-          ffprobe -version | head -1
-
-      - name: Generate test video
+      - name: Generate 180-second source
         run: |
           ffmpeg -hide_banner -loglevel error \
             -f lavfi \
             -i testsrc2=size=1920x1080:rate=30 \
-            -t 60 \
+            -t 180 \
             -c:v libx264 \
             -preset ultrafast \
             -crf 23 \
             -pix_fmt yuv420p \
             test-source.mp4
 
-      - name: Benchmark ClipShortener-style processing
+      - name: Benchmark 180-second 1080p to 9:16
         run: |
           mkdir -p output
 
@@ -52,8 +49,8 @@ jobs:
             -preset ultrafast \
             -crf 23 \
             -pix_fmt yuv420p \
-            -threads 4 \
-            -filter_threads 4 \
+            -threads 0 \
+            -filter_threads 0 \
             -an \
             output/test.mp4
 
@@ -67,4 +64,4 @@ jobs:
             -show_entries format=duration,size \
             -show_entries stream=width,height,r_frame_rate \
             -of default=noprint_wrappers=1 \
-            output/test.mp4
+            output/test.mp44
