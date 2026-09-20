@@ -1,0 +1,41 @@
+name: ClipShortener Processor
+
+on:
+  repository_dispatch:
+    types: [clipshortener-process]
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out worker
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-worker.txt
+
+      - name: Run ClipShortener job
+        env:
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          JOB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          CONTROL_URL: ${{ secrets.CONTROL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLIPSHORTENER_FFMPEG_THREADS: "0"
+          CLIPSHORTENER_FILTER_THREADS: "0"
+          CLIPSHORTENER_FFMPEG_PRESET: "ultrafast"
+          CLIPSHORTENER_FFMPEG_TUNE: ""
+          CLIPSHORTENER_X264_PARAMS: ""
+          CLIPSHORTENER_UPLOAD_FSYNC: "0"
+          CLIPSHORTENER_NO_UPSCALE: "1"
+          CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "0"
+        run: python process_job.py
