@@ -26,10 +26,9 @@ jobs:
           JOB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           CONTROL_URL: ${{ secrets.CONTROL_URL }}
           WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
           CLIPSHORTENER_FFMPEG_THREADS: "0"
           CLIPSHORTENER_FILTER_THREADS: "0"
           CLIPSHORTENER_FFMPEG_PRESET: "ultrafast"
