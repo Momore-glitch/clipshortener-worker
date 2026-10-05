@@ -1,9 +1,10 @@
 name: ClipShortener Processor
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
   repository_dispatch:
-    types: [clipshortener-process]
+    types:
+      - clipshortener-process
 
 jobs:
   process:
