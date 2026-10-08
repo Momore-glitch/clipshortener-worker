@@ -8,15 +8,12 @@ on:
 
 jobs:
 
-  # ---------------------------------------------------------
-  # MANUAL B2 AUTHENTICATION TEST
-  # ---------------------------------------------------------
   b2-auth-test:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Backblaze B2 authentication
+      - name: Verify B2 credentials
         env:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
@@ -27,70 +24,128 @@ jobs:
 
           python - <<'PY'
           import base64
+          import hashlib
           import json
           import os
-          import urllib.request
           import urllib.error
+          import urllib.request
 
-          key_id = os.environ["B2_KEY_ID"]
-          app_key = os.environ["B2_APPLICATION_KEY"]
-          bucket = os.environ["B2_BUCKET"]
+          key_id = os.environ.get("B2_KEY_ID", "")
+          app_key = os.environ.get("B2_APPLICATION_KEY", "")
+          bucket = os.environ.get("B2_BUCKET", "")
 
-          credentials = f"{key_id}:{app_key}".encode("utf-8")
-          encoded = base64.b64encode(credentials).decode("ascii")
+          def shape(value):
+              return {
+                  "length": len(value),
+                  "trimmed_length": len(value.strip()),
+                  "has_outer_whitespace": value != value.strip(),
+                  "fingerprint": hashlib.sha256(
+                      value.encode("utf-8")
+                  ).hexdigest()[:12],
+              }
 
-          request = urllib.request.Request(
-              "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
-              method="GET",
-              headers={
-                  "Authorization": f"Basic {encoded}",
-                  "Accept": "application/json",
-              },
-          )
+          print("KEY_ID:", json.dumps(shape(key_id)))
+          print("APPLICATION_KEY:", json.dumps(shape(app_key)))
+          print("BUCKET:", bucket)
 
-          try:
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  body = response.read().decode("utf-8")
-                  data = json.loads(body)
+          if not key_id:
+              raise SystemExit("B2_KEY_ID is EMPTY in GitHub Actions.")
 
-                  storage = data.get("apiInfo", {}).get("storageApi", {})
-                  allowed = storage.get("allowed", {}).get("buckets", [])
+          if not app_key:
+              raise SystemExit(
+                  "B2_APPLICATION_KEY is EMPTY in GitHub Actions."
+              )
 
-                  bucket_found = any(
-                      item.get("name") == bucket
-                      for item in allowed
-                  )
+          if not bucket:
+              raise SystemExit("B2_BUCKET is EMPTY in GitHub Actions.")
 
-                  print("===================================")
-                  print("B2 AUTHENTICATION: SUCCESS")
-                  print("HTTP STATUS:", response.status)
-                  print("STORAGE API: AVAILABLE")
-                  print("BUCKET CONFIGURED:", bucket)
-                  print("BUCKET VISIBLE TO KEY:", bucket_found)
-                  print("===================================")
+          def authorize(label, kid, key):
+              raw = f"{kid}:{key}".encode("utf-8")
+              basic = base64.b64encode(raw).decode("ascii")
 
-                  if not bucket_found:
-                      raise RuntimeError(
-                          f'B2 authentication succeeded, but bucket "{bucket}" '
-                          "was not visible to this application key."
+              req = urllib.request.Request(
+                  "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+                  method="GET",
+                  headers={
+                      "Authorization": f"Basic {basic}",
+                      "Accept": "application/json",
+                      "User-Agent": "ClipShortener-B2-Diagnostic/1.0",
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      data = json.loads(
+                          response.read().decode("utf-8")
                       )
 
-          except urllib.error.HTTPError as error:
-              body = error.read().decode("utf-8", "replace")
+                      storage = (
+                          data.get("apiInfo", {})
+                          .get("storageApi", {})
+                      )
 
-              print("===================================")
-              print("B2 AUTHENTICATION: FAILED")
-              print("HTTP STATUS:", error.code)
-              print(body)
-              print("===================================")
+                      allowed = (
+                          storage.get("allowed", {})
+                          .get("buckets", [])
+                      )
 
-              raise
+                      bucket_found = any(
+                          item.get("name") == bucket
+                          for item in allowed
+                      )
+
+                      print(f"B2_TEST_{label}=SUCCESS")
+                      print("HTTP:", response.status)
+                      print(
+                          "STORAGE_API:",
+                          bool(storage)
+                      )
+                      print(
+                          "BUCKET_VISIBLE:",
+                          bucket_found
+                      )
+
+                      return True
+
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode(
+                      "utf-8",
+                      "replace"
+                  )
+
+                  print(f"B2_TEST_{label}=FAILED")
+                  print("HTTP:", error.code)
+                  print("BODY:", body)
+
+                  return False
+
+          raw_ok = authorize(
+              "RAW",
+              key_id,
+              app_key
+          )
+
+          if raw_ok:
+              print("FINAL_RESULT=B2_AUTHENTICATION_SUCCESS")
+              raise SystemExit(0)
+
+          trimmed_ok = authorize(
+              "TRIMMED",
+              key_id.strip(),
+              app_key.strip()
+          )
+
+          if trimmed_ok:
+              raise SystemExit(
+                  "FINAL_RESULT=SECRET_WHITESPACE_ERROR"
+              )
+
+          raise SystemExit(
+              "FINAL_RESULT=B2_CREDENTIAL_REJECTED"
+          )
           PY
 
 
-  # ---------------------------------------------------------
-  # REAL PRODUCTION PROCESSOR
-  # ---------------------------------------------------------
   process:
     if: ${{ github.event_name == 'repository_dispatch' }}
 
@@ -106,7 +161,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-
           python -m pip install --upgrade pip
           python -m pip install -r requirements-worker.txt
 
