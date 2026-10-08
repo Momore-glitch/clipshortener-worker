@@ -7,11 +7,98 @@ on:
       - clipshortener-process
 
 jobs:
+
+  # ---------------------------------------------------------
+  # MANUAL B2 AUTHENTICATION TEST
+  # ---------------------------------------------------------
+  b2-auth-test:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test Backblaze B2 authentication
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+
+          key_id = os.environ["B2_KEY_ID"]
+          app_key = os.environ["B2_APPLICATION_KEY"]
+          bucket = os.environ["B2_BUCKET"]
+
+          credentials = f"{key_id}:{app_key}".encode("utf-8")
+          encoded = base64.b64encode(credentials).decode("ascii")
+
+          request = urllib.request.Request(
+              "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+              method="GET",
+              headers={
+                  "Authorization": f"Basic {encoded}",
+                  "Accept": "application/json",
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  body = response.read().decode("utf-8")
+                  data = json.loads(body)
+
+                  storage = data.get("apiInfo", {}).get("storageApi", {})
+                  allowed = storage.get("allowed", {}).get("buckets", [])
+
+                  bucket_found = any(
+                      item.get("name") == bucket
+                      for item in allowed
+                  )
+
+                  print("===================================")
+                  print("B2 AUTHENTICATION: SUCCESS")
+                  print("HTTP STATUS:", response.status)
+                  print("STORAGE API: AVAILABLE")
+                  print("BUCKET CONFIGURED:", bucket)
+                  print("BUCKET VISIBLE TO KEY:", bucket_found)
+                  print("===================================")
+
+                  if not bucket_found:
+                      raise RuntimeError(
+                          f'B2 authentication succeeded, but bucket "{bucket}" '
+                          "was not visible to this application key."
+                      )
+
+          except urllib.error.HTTPError as error:
+              body = error.read().decode("utf-8", "replace")
+
+              print("===================================")
+              print("B2 AUTHENTICATION: FAILED")
+              print("HTTP STATUS:", error.code)
+              print(body)
+              print("===================================")
+
+              raise
+          PY
+
+
+  # ---------------------------------------------------------
+  # REAL PRODUCTION PROCESSOR
+  # ---------------------------------------------------------
   process:
+    if: ${{ github.event_name == 'repository_dispatch' }}
+
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
+
       - name: Check out worker
         uses: actions/checkout@v4
 
@@ -19,6 +106,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+
           python -m pip install --upgrade pip
           python -m pip install -r requirements-worker.txt
 
@@ -26,11 +114,14 @@ jobs:
         env:
           JOB_ID: ${{ github.event.client_payload.job_id }}
           JOB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+
           CONTROL_URL: ${{ secrets.CONTROL_URL }}
           WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
+
           CLIPSHORTENER_FFMPEG_THREADS: "0"
           CLIPSHORTENER_FILTER_THREADS: "0"
           CLIPSHORTENER_FFMPEG_PRESET: "ultrafast"
@@ -39,4 +130,5 @@ jobs:
           CLIPSHORTENER_UPLOAD_FSYNC: "0"
           CLIPSHORTENER_NO_UPSCALE: "1"
           CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "0"
+
         run: python process_job.py
