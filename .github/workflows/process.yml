@@ -17,7 +17,6 @@ jobs:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
-
         run: |
           set -euo pipefail
 
@@ -50,13 +49,8 @@ jobs:
               with urllib.request.urlopen(request, timeout=30) as response:
                   data = json.loads(response.read().decode("utf-8"))
                   storage = data["apiInfo"]["storageApi"]
-
                   allowed = storage.get("allowed", {}).get("buckets", [])
-
-                  bucket_visible = any(
-                      item.get("name") == bucket
-                      for item in allowed
-                  )
+                  bucket_visible = any(item.get("name") == bucket for item in allowed)
 
                   print("B2_AUTHENTICATION=SUCCESS")
                   print("HTTP_STATUS:", response.status)
@@ -70,34 +64,38 @@ jobs:
           except urllib.error.HTTPError as error:
               print("B2_AUTHENTICATION=FAILED")
               print("HTTP_STATUS:", error.code)
-              print(
-                  error.read().decode(
-                      "utf-8",
-                      "replace"
-                  )
-              )
+              print(error.read().decode("utf-8", "replace"))
               raise
           PY
 
   process:
     if: ${{ github.event_name == 'repository_dispatch' }}
-
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     steps:
       - name: Check out worker
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+
+      - name: Set up Python with pip cache
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-worker.txt
 
       - name: Install FFmpeg and Python dependencies
+        id: install_dependencies
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-worker.txt
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --disable-pip-version-check -r requirements-worker.txt
 
       - name: Run ClipShortener job
+        id: process_job
+        timeout-minutes: 80
         env:
           JOB_ID: ${{ github.event.client_payload.job.id }}
           JOB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
@@ -117,5 +115,57 @@ jobs:
           CLIPSHORTENER_UPLOAD_FSYNC: "0"
           CLIPSHORTENER_NO_UPSCALE: "1"
           CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "0"
-
         run: python process_job.py
+
+      - name: Report environment setup failure to ClipShortener
+        if: ${{ failure() && github.event_name == 'repository_dispatch' && steps.install_dependencies.outcome == 'failure' }}
+        env:
+          JOB_ID: ${{ github.event.client_payload.job.id }}
+          CONTROL_URL: ${{ secrets.CONTROL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          job_id = os.environ.get("JOB_ID", "").strip()
+          base = os.environ.get("CONTROL_URL", "").strip().rstrip("/")
+          secret = os.environ.get("WORKER_SECRET", "").strip()
+
+          if not job_id or not base or not secret:
+              print(
+                  "Could not report setup failure: "
+                  "required status callback configuration is missing."
+              )
+              raise SystemExit(0)
+
+          body = json.dumps({
+              "status": "error",
+              "progress": 0,
+              "message": (
+                  "Processor setup failed before video processing started. "
+                  "Please retry; dependency installation timed out or failed."
+              )
+          }).encode("utf-8")
+
+          request = urllib.request.Request(
+              f"{base}/api/jobs/{job_id}/worker-status",
+              data=body,
+              method="POST",
+              headers={
+                  "X-Worker-Secret": secret,
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  print(
+                      f"Reported setup failure to ClipShortener "
+                      f"(HTTP {response.status})."
+                  )
+          except Exception as error:
+              print(f"Could not report setup failure to ClipShortener: {error}")
+          PY
