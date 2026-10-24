@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote
@@ -24,6 +25,7 @@ ROOT = Path("/tmp/clipshortener-worker")
 JOBDIR = ROOT / "job"
 JOBDIR.mkdir(parents=True, exist_ok=True)
 SOURCE = JOBDIR / PAYLOAD.get("filename", "input.mp4")
+UPLOAD_BLOCK_SIZE = 16 * 1024 * 1024
 
 
 def auth():
@@ -79,13 +81,24 @@ def download_source():
     ) as response:
         response.raise_for_status()
         with temp.open("wb") as out:
-            for block in response.iter_content(chunk_size=16 * 1024 * 1024):
+            for block in response.iter_content(chunk_size=UPLOAD_BLOCK_SIZE):
                 if block:
                     out.write(block)
     temp.replace(SOURCE)
 
 
 def b2_upload_file(path: Path, key: str, content_type: str):
+    """Stream an output to B2 while hashing it, avoiding a separate hash pass.
+
+    B2's native API supports X-Bz-Content-Sha1=hex_digits_at_end: the client
+    appends the computed 40-byte SHA-1 hex digest to the request body and sets
+    Content-Length to file size + 40. B2 verifies the checksum before accepting
+    the upload, so integrity checking is retained while avoiding a full extra
+    disk read before every output upload.
+    """
+    size = path.stat().st_size
+    upload_started = time.monotonic()
+
     for attempt in range(1, 5):
         token, api_url, _, bucket_id = auth()
         upload_info_response = requests.get(
@@ -100,32 +113,52 @@ def b2_upload_file(path: Path, key: str, content_type: str):
         info = upload_info_response.json()
 
         digest = hashlib.sha1()
-        with path.open("rb") as source:
-            for block in iter(lambda: source.read(16 * 1024 * 1024), b""):
-                digest.update(block)
 
-        size = path.stat().st_size
-        try:
+        def request_body():
             with path.open("rb") as source:
-                response = requests.post(
-                    info["uploadUrl"],
-                    headers={
-                        "Authorization": info["authorizationToken"],
-                        "X-Bz-File-Name": quote(key, safe=""),
-                        "Content-Type": content_type,
-                        "Content-Length": str(size),
-                        "X-Bz-Content-Sha1": digest.hexdigest(),
-                    },
-                    data=source,
-                    timeout=(30, 1800),
-                )
+                for block in iter(lambda: source.read(UPLOAD_BLOCK_SIZE), b""):
+                    digest.update(block)
+                    yield block
+            # B2 expects the hexadecimal checksum as the final 40 body bytes.
+            yield digest.hexdigest().encode("ascii")
+
+        try:
+            response = requests.post(
+                info["uploadUrl"],
+                headers={
+                    "Authorization": info["authorizationToken"],
+                    "X-Bz-File-Name": quote(key, safe=""),
+                    "Content-Type": content_type,
+                    "Content-Length": str(size + 40),
+                    "X-Bz-Content-Sha1": "hex_digits_at_end",
+                },
+                data=request_body(),
+                timeout=(30, 1800),
+            )
         except requests.RequestException:
             if attempt < 4:
                 continue
             raise
 
         if response.ok:
-            return response.json()
+            result = response.json()
+            local_sha1 = digest.hexdigest().lower()
+            remote_sha1 = str(
+                result.get("contentSha1") or result.get("content_sha1") or ""
+            ).lower()
+            if remote_sha1 and remote_sha1 not in {"none", local_sha1}:
+                raise RuntimeError(
+                    f"B2 checksum mismatch for {path.name}: "
+                    f"local={local_sha1} remote={remote_sha1}"
+                )
+            elapsed = time.monotonic() - upload_started
+            print(
+                f"B2_OUTPUT_UPLOAD_OK file={path.name} bytes={size} "
+                f"seconds={elapsed:.2f} sha1_verified={bool(remote_sha1 == local_sha1)}",
+                flush=True,
+            )
+            return result
+
         if response.status_code in (401,) or response.status_code >= 500:
             if attempt < 4:
                 continue
@@ -182,16 +215,32 @@ def upload_outputs():
 
 
 def main():
+    job_started = time.monotonic()
     status("processing", 1, "Processing worker started.")
     status("processing", 5, "Downloading source from B2...")
+
+    download_started = time.monotonic()
     download_source()
+    download_seconds = time.monotonic() - download_started
+    print(
+        f"PHASE_DOWNLOAD seconds={download_seconds:.2f} bytes={SOURCE.stat().st_size}",
+        flush=True,
+    )
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import app
 
     info = app.probe(SOURCE)
+    print(
+        "SOURCE_PROFILE "
+        f"bytes={SOURCE.stat().st_size} duration={info['duration']:.3f} "
+        f"width={info['width']} height={info['height']} "
+        f"avg_fps={info['avg_frame_rate']} r_fps={info['r_frame_rate']}",
+        flush=True,
+    )
     status("processing", 16, "Creating clips...")
 
+    encode_started = time.monotonic()
     clips = app.create_clips(
         JOB_ID,
         SOURCE,
@@ -202,13 +251,37 @@ def main():
         PAYLOAD.get("captions"),
         info=info,
     )
+    encode_seconds = time.monotonic() - encode_started
 
     if not clips:
         raise RuntimeError("No clips were produced.")
 
+    output_bytes = sum(path.stat().st_size for path in clips if path.is_file())
+    print(
+        f"PHASE_CLIP_PROCESS seconds={encode_seconds:.2f} clips={len(clips)} "
+        f"output_bytes={output_bytes}",
+        flush=True,
+    )
+
     status("processing", 80, f"Uploading {len(clips)} finished clips...")
+    upload_started = time.monotonic()
     result = upload_outputs()
+    upload_seconds = time.monotonic() - upload_started
+    print(
+        f"PHASE_OUTPUT_UPLOAD seconds={upload_seconds:.2f} clips={len(result)} "
+        f"output_bytes={sum(int(item.get('size') or 0) for item in result)}",
+        flush=True,
+    )
+
     status("complete", 100, "Your clips are ready.", result)
+    print(
+        f"PHASE_JOB_TOTAL seconds={time.monotonic() - job_started:.2f} "
+        f"download_seconds={download_seconds:.2f} encode_seconds={encode_seconds:.2f} "
+        f"output_upload_seconds={upload_seconds:.2f} input_bytes={SOURCE.stat().st_size} "
+        f"output_bytes={sum(int(item.get('size') or 0) for item in result)} "
+        f"clips={len(result)}",
+        flush=True,
+    )
 
     SOURCE.unlink(missing_ok=True)
 
