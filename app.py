@@ -33,7 +33,7 @@ try:
 except Exception:
     WhisperModel = None
 
-VERSION = "49.1.0-gop-drift-guard"
+VERSION = "49.2.0-gop-drift-normalizer"
 DATA_ROOT = Path(os.getenv("CLIPSHORTENER_DATA", "/tmp/clipshortener"))
 JOBS_ROOT = DATA_ROOT / "jobs"
 JOBS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -91,8 +91,6 @@ MAX_URL_REDIRECTS = 5
 URL_READ_CHUNK = 4 * 1024 * 1024
 ACQUISITION_TIMEOUT = int(os.getenv("CLIPSHORTENER_ACQUISITION_TIMEOUT", "180"))
 ACQUISITION_API_URL = os.getenv("ACQUISITION_API_URL", "").strip().rstrip("/")
-
-
 def _source_fps(info: dict[str, Any]) -> float | None:
     """Return a reliable constant frame rate when the source exposes one."""
     for key in ("avg_frame_rate", "r_frame_rate"):
@@ -110,7 +108,6 @@ def _source_fps(info: dict[str, Any]) -> float | None:
         except (ValueError, ZeroDivisionError):
             continue
     return None
-
 
 def _fixed_gop_args(info: dict[str, Any], clip_length: float, total_duration: float) -> list[str]:
     """Use fixed GOPs only when cumulative boundary drift stays within tolerance.
@@ -154,11 +151,48 @@ def _fixed_gop_args(info: dict[str, Any], clip_length: float, total_duration: fl
 
     return ["-g", str(frames), "-keyint_min", str(frames), "-sc_threshold", "0"]
 
+def _timing_fps_filter(info: dict[str, Any], clip_length: float, total_duration: float) -> str | None:
+    """Normalize common fractional broadcast rates when fixed-GOP drift is unsafe.
+
+    A 29.97 FPS source cannot place a source frame at every exact 30-second
+    boundary: 30 seconds is 899.1 source frames. Across a long video this can
+    put cuts a few frames off the requested boundary. When the existing drift
+    guard rejects fixed GOPs, normalize common rates such as 23.976, 29.97 and
+    59.94 FPS to their standard integer rates (24, 30 and 60) for transformed
+    exports. That lets the segmenter cut on an exact frame boundary, e.g. 900
+    frames per 30-second clip at 30 FPS. The source-copy path is unaffected.
+    """
+    fps = _source_fps(info)
+    if fps is None or clip_length <= 0.05 or total_duration <= 0:
+        return None
+
+    frames = max(1, int(round(fps * clip_length)))
+    if frames < 2:
+        return None
+
+    segment_count = max(1, int(math.ceil((total_duration - 1e-6) / clip_length)))
+    boundary_count = max(0, segment_count - 1)
+    cumulative_drift = abs((frames / fps) - clip_length) * boundary_count
+    if cumulative_drift <= 0.015:
+        return None
+
+    target_fps = int(round(fps))
+    common_rates = {24, 25, 30, 50, 60, 120}
+    if target_fps not in common_rates or abs(fps - target_fps) > 0.1 or abs(fps - target_fps) < 0.001:
+        return None
+
+    log.info(
+        "OUTPUT_FPS_NORMALIZED source_fps=%.6f output_fps=%d clip_length=%.3f "
+        "segments=%d original_cumulative_drift=%.6f",
+        fps, target_fps, clip_length, segment_count, cumulative_drift,
+    )
+    return f"fps={target_fps}:round=near"
+
 
 def _effective_cpu_threads() -> int:
     """Choose FFmpeg threads from Render's assigned CPU count first.
 
-    Render exposes the service CPU allocation as RENDER_CPU_COUNT. That is a
+    Render exposes the service CPU allocation as RENDER_CPU_COUNT.  That is a
     better signal than the host/cgroup CPU view for deciding how much parallel
     work a single x264 encode should request.
     """
@@ -195,7 +229,6 @@ def _effective_cpu_threads() -> int:
         return 0
     return max(1, min(8, int(math.ceil(quota))))
 
-
 FFMPEG_THREADS = _effective_cpu_threads()
 FFMPEG_FILTER_THREADS = max(1, min(4, int(os.getenv("CLIPSHORTENER_FILTER_THREADS", str(FFMPEG_THREADS or 1)))))
 FFMPEG_PRESET = os.getenv("CLIPSHORTENER_FFMPEG_PRESET", "ultrafast").strip() or "ultrafast"
@@ -211,11 +244,9 @@ FFMPEG_PROGRESS_PERIOD = os.getenv("CLIPSHORTENER_PROGRESS_PERIOD", "2")
 VALIDATE_OUTPUT_DURATIONS = os.getenv("CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS", "0").strip().lower() in {"1", "true", "yes", "on"}
 NO_UPSCALE = os.getenv("CLIPSHORTENER_NO_UPSCALE", "1").strip().lower() in {"1", "true", "yes", "on"}
 
-
 def _host_is_platform(host: str) -> bool:
     host = (host or "").lower().rstrip(".")
     return any(host == item or host.endswith("." + item) for item in PLATFORM_HOSTS)
-
 
 def _host_is_public(host: str) -> bool:
     if not host:
@@ -234,7 +265,6 @@ def _host_is_public(host: str) -> bool:
         if not ip.is_global:
             return False
     return True
-
 
 def _validate_source_url(value: str) -> tuple[str, bool]:
     value = (value or "").strip()
@@ -400,7 +430,7 @@ def _acquire_public_video(job_id: str, url: str) -> tuple[Path, str]:
         try:
             response = urlopen(req, timeout=30)
         except HTTPError as exc:
-            if exc.code in {301, 302, 303, 307, 308}:
+            if exc.code in {301,302,303,307,308}:
                 location = exc.headers.get("Location")
                 exc.close()
                 if not location:
@@ -500,7 +530,7 @@ def load_persisted_jobs() -> None:
 
 
 def cleanup_old_jobs() -> None:
-    # Never remove active jobs. Also use the job-state file timestamp rather
+    # Never remove active jobs.  Also use the job-state file timestamp rather
     # than the directory mtime: updating job.json does not reliably update the
     # parent directory mtime, which could otherwise make a long-running job
     # look stale.
@@ -626,7 +656,6 @@ def run_ffmpeg_progress(
     except RuntimeError:
         raise
 
-
 def probe(path: Path) -> dict[str, Any]:
     result = run_checked([
         FFPROBE, "-v", "error", "-show_entries",
@@ -676,20 +705,15 @@ def _normalize_export_options(export_quality: Any = "original", export_ratio: An
     }
     if q == "original" and r == "source" and legacy in legacy_map and legacy != "original":
         q, r = legacy_map[legacy]
-    if q in {"720p", "720"}:
-        q = "720"
-    elif q in {"1080p", "1080"}:
-        q = "1080"
-    elif q in {"original", "source"}:
-        q = "original"
-    else:
-        raise HTTPException(400, "Unsupported export quality.")
-    ratio_alias = {"original": "source", "source": "source", "16/9": "16:9", "9/16": "9:16", "square": "1:1", "1/1": "1:1"}
+    if q in {"720p", "720"}: q = "720"
+    elif q in {"1080p", "1080"}: q = "1080"
+    elif q in {"original", "source"}: q = "original"
+    else: raise HTTPException(400, "Unsupported export quality.")
+    ratio_alias = {"original":"source", "source":"source", "16/9":"16:9", "9/16":"9:16", "square":"1:1", "1/1":"1:1"}
     r = ratio_alias.get(r, r)
     if r not in {"source", "16:9", "9:16", "1:1"}:
         raise HTTPException(400, "Unsupported export ratio.")
     return q, r
-
 
 def validate_options(clip_length: Any, export_format: str = "original", start: Any = 0, end: Any = 0, export_quality: Any = "original", export_ratio: Any = "source") -> tuple[float, str, float, float | None]:
     length = parse_number(clip_length, 30)
@@ -702,7 +726,6 @@ def validate_options(clip_length: Any, export_format: str = "original", start: A
     end_value = None if end_num <= 0 else max(0.1, end_num)
     return length, export, start_value, end_value
 
-
 def split_export_spec(export_format: str) -> tuple[str, str]:
     value = str(export_format or "original").strip().lower()
     if ":" in value:
@@ -710,11 +733,10 @@ def split_export_spec(export_format: str) -> tuple[str, str]:
         return _normalize_export_options(q, r, "original")
     return _normalize_export_options("original", "source", value)
 
-
 def _target_dimensions(info: dict[str, Any], export_format: str) -> tuple[int, int] | None:
     """Return the cheapest valid output dimensions for the requested preset.
 
-    The important optimization here is source-class aware output routing. A
+    The important optimization here is *source-class aware output routing*. A
     1280x720 source selected for a 1080/9:16 export is not promoted to a
     1080x1920 encode. It is routed to the 720-class 720x1280 path instead,
     avoiding a roughly 4x output-pixel increase while retaining a useful
@@ -773,7 +795,6 @@ def _target_dimensions(info: dict[str, Any], export_format: str) -> tuple[int, i
             else:
                 requested = (720, 720)
     return requested
-
 
 def video_filter(export_format: str, info: dict[str, Any] | None = None) -> str | None:
     """Build the cheapest correct resize/crop filter.
@@ -861,7 +882,6 @@ def caption_style(style: str, font: str, size: str, position: str, animation: st
         "tags": r"\fad(120,120)" if animation == "fade" else (r"\fscx92\fscy92\t(0,120,\fscx100\fscy100)" if animation == "pop" else ""),
     }
 
-
 def _caption_segments(video: Path, language: str, clip_start: float = 0.0, clip_end: float | None = None) -> list[tuple[float, float, str]]:
     """Transcribe only the requested export window and cache one tiny model."""
     global whisper_model
@@ -913,87 +933,54 @@ def _caption_segments(video: Path, language: str, clip_start: float = 0.0, clip_
         raise RuntimeError("No speech was detected for automatic captions.")
     return out
 
-
 def _wrap_caption(text: str, max_chars: int = 34) -> str:
-    words = text.split()
-    lines = []
-    current = ""
+    words = text.split(); lines=[]; current=""
     for word in words:
-        if not current:
-            current = word
-        elif len(current) + 1 + len(word) <= max_chars:
-            current += " " + word
-        else:
-            lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+        if not current: current=word
+        elif len(current)+1+len(word) <= max_chars: current += " " + word
+        else: lines.append(current); current=word
+    if current: lines.append(current)
     return "\n".join(lines[:2])
-
 
 def caption_tracks_from_segments(segments, clip_start, clip_duration, style, font, size, animation, position, ass, vtt, canvas_w=1920, canvas_h=1080) -> None:
     settings = caption_style(style, font, size, position, animation, canvas_w, canvas_h)
-
     def ass_time(seconds):
-        cs = int(round(max(0, seconds) * 100))
-        h, cs = divmod(cs, 360000)
-        m, cs = divmod(cs, 6000)
-        sec, cs = divmod(cs, 100)
-        return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
-
+        cs=int(round(max(0, seconds)*100)); h,cs=divmod(cs,360000); m,cs=divmod(cs,6000); sec,cs=divmod(cs,100); return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
     def vtt_time(seconds):
-        total = max(0, seconds)
-        h = int(total // 3600)
-        total -= h * 3600
-        m = int(total // 60)
-        total -= m * 60
-        sec = int(total)
-        ms = int(round((total - sec) * 1000))
-        if ms >= 1000:
-            sec += 1
-            ms -= 1000
+        total=max(0,seconds); h=int(total//3600); total-=h*3600; m=int(total//60); total-=m*60; sec=int(total); ms=int(round((total-sec)*1000));
+        if ms>=1000: sec+=1; ms-=1000
         return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
-
-    count = 0
-    clip_end = clip_start + clip_duration
-    with ass.open("w", encoding="utf-8") as af, vtt.open("w", encoding="utf-8") as vfout:
+    count=0; clip_end=clip_start+clip_duration
+    with ass.open("w",encoding="utf-8") as af, vtt.open("w",encoding="utf-8") as vfout:
         af.write(f"[Script Info]\nScriptType: v4.00+\nPlayResX: {canvas_w}\nPlayResY: {canvas_h}\nWrapStyle: 2\n\n")
         af.write("[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n")
         af.write(f"Style,Default,{settings['font']},{settings['size']},&H00FFFFFF,&H00FFFFFF,&H00000000,{settings['back']},{settings['bold']},0,0,0,100,100,0,0,{settings['border_style']},{settings['outline']},{settings['shadow']},{settings['align']},{settings['margin_lr']},{settings['margin_lr']},{settings['margin_v']},1\n\n")
         af.write("[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n")
         # Re-open VTT header correctly; ASS and VTT are separate files, so write VTT independently below.
-    with ass.open("a", encoding="utf-8") as af, vtt.open("w", encoding="utf-8") as vfout:
+    with ass.open("a",encoding="utf-8") as af, vtt.open("w",encoding="utf-8") as vfout:
         vfout.write("WEBVTT\n\n")
-        for st, en, text in segments:
-            if en <= clip_start or st >= clip_end:
-                continue
-            ls = max(0.0, st - clip_start)
-            le = min(clip_duration, en - clip_start)
-            if le <= ls:
-                continue
-            wrapped = _wrap_caption(text, 34 if canvas_w >= 1000 else 24)
+        for st,en,text in segments:
+            if en<=clip_start or st>=clip_end: continue
+            ls=max(0.0,st-clip_start); le=min(clip_duration,en-clip_start)
+            if le<=ls: continue
+            wrapped=_wrap_caption(text, 34 if canvas_w>=1000 else 24)
             if position == "top":
-                placement = f"\\an8\\pos({canvas_w // 2},{settings['margin_v']})"
+                placement = f"\\an8\\pos({canvas_w//2},{settings['margin_v']})"
             elif position == "middle":
-                placement = f"\\an5\\pos({canvas_w // 2},{canvas_h // 2})"
+                placement = f"\\an5\\pos({canvas_w//2},{canvas_h//2})"
             else:
-                placement = f"\\an2\\pos({canvas_w // 2},{canvas_h - settings['margin_v']})"
-            tags = placement + settings["tags"]
+                placement = f"\\an2\\pos({canvas_w//2},{canvas_h-settings['margin_v']})"
+            tags = placement + settings['tags']
             af.write(f"Dialogue: 0,{ass_time(ls)},{ass_time(le)},Default,,0,0,0,,{{{tags}}}{ass_escape(wrapped)}\n")
             vfout.write(f"{vtt_time(ls)} --> {vtt_time(le)}\n{text}\n\n")
-            count += 1
-    if count == 0:
-        ass.unlink(missing_ok=True)
-        vtt.unlink(missing_ok=True)
+            count+=1
+    if count==0: ass.unlink(missing_ok=True); vtt.unlink(missing_ok=True)
 
-
-def burn_captions(video: Path, ass_path: Path, output: Path, job_id: str | None = None, duration: float | None = None) -> None:
-    escaped = str(ass_path).replace("\\", "/").replace(":", r"\:")
-    cmd = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-vf", f"subtitles='{escaped}'", "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-threads", str(FFMPEG_THREADS), "-c:a", "aac", "-b:a", "128k", str(output)]
-    if job_id and duration:
-        run_ffmpeg_progress(cmd, job_id, duration, 70, 25, max(900, int(duration * 8)))
-    else:
-        run_checked(cmd, timeout=1800)
+def burn_captions(video: Path, ass_path: Path, output: Path, job_id: str | None=None, duration: float | None=None) -> None:
+    escaped=str(ass_path).replace("\\","/").replace(":",r"\:")
+    cmd=[FFMPEG,"-nostdin","-hide_banner","-loglevel","error","-y","-i",str(video),"-vf",f"subtitles='{escaped}'","-map","0:v:0","-map","0:a?","-c:v","libx264","-preset","ultrafast","-crf","21","-threads",str(FFMPEG_THREADS),"-c:a","aac","-b:a","128k",str(output)]
+    if job_id and duration: run_ffmpeg_progress(cmd,job_id,duration,70,25,max(900,int(duration*8)))
+    else: run_checked(cmd,timeout=1800)
 
 
 def _durations_are_consistent(clips: list[Path], clip_length: float, total_duration: float, tolerance: float = 0.20) -> bool:
@@ -1031,7 +1018,6 @@ def _durations_are_consistent(clips: list[Path], clip_length: float, total_durat
 
 def export_matches_source(info: dict[str, Any], export_format: str) -> bool:
     return _target_dimensions(info, export_format) in {None, (int(info.get("width") or 0), int(info.get("height") or 0))}
-
 
 def _vtt_timestamp(seconds: float) -> str:
     total = max(0.0, float(seconds))
@@ -1155,6 +1141,9 @@ def create_clips(job_id, source, clip_length, export_format, start, end, caption
             if full_ass.exists():
                 escaped = str(full_ass).replace("\\", "/").replace(":", r"\:")
                 filters.append(f"subtitles='{escaped}'")
+            timing_fps_filter = _timing_fps_filter(info, clip_length, total_duration)
+            if timing_fps_filter:
+                filters.append(timing_fps_filter)
 
             gop_args = _fixed_gop_args(info, clip_length, total_duration)
             last_boundary = max(0.0, total_duration - 0.05)
@@ -1174,7 +1163,7 @@ def create_clips(job_id, source, clip_length, export_format, start, end, caption
                 *(gop_args if gop_args else ["-force_key_frames", force_expr]),
                 # Audio does not need to be re-encoded for captions/cropping.
                 # AAC keeps the generated MP4 broadly compatible.
-                *(["-c:a", "copy"] if str(info.get("audio_codec", "")).lower() == "aac" else ["-c:a", "aac", "-b:a", "128k"]),
+                *( ["-c:a", "copy"] if str(info.get("audio_codec", "")).lower() == "aac" else ["-c:a", "aac", "-b:a", "128k"] ),
                 "-f", "segment", "-segment_time", f"{clip_length:.6f}",
                 "-segment_time_delta", "0.02", "-reset_timestamps", "1",
             ]
@@ -1248,9 +1237,8 @@ def create_clips(job_id, source, clip_length, export_format, start, end, caption
             "-threads", str(FFMPEG_THREADS),
             "-filter_threads", str(FFMPEG_FILTER_THREADS),
             "-filter_complex_threads", str(FFMPEG_FILTER_THREADS),
-            *(["-c:a", "copy"] if str(info.get("audio_codec", "")).lower() == "aac" else ["-c:a", "aac", "-b:a", "128k"]),
+            *( ["-c:a", "copy"] if str(info.get("audio_codec", "")).lower() == "aac" else ["-c:a", "aac", "-b:a", "128k"] ),
         ]
-        filters = [transform] if transform else []
         if filters:
             single_cmd += ["-vf", ",".join(filters)]
         if str(info.get("pix_fmt", "")).lower() != "yuv420p":
@@ -1275,6 +1263,9 @@ def create_clips(job_id, source, clip_length, export_format, start, end, caption
     last_boundary = max(0.0, total_duration - 0.05)
     force_expr = f"expr:if(lt(t,{last_boundary:.3f}),gte(t,n_forced*{clip_length:.6f}),0)"
     filters = [transform] if transform else []
+    timing_fps_filter = _timing_fps_filter(info, clip_length, total_duration)
+    if timing_fps_filter:
+        filters.append(timing_fps_filter)
     encode_cmd = [
         FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
         "-sws_flags", "fast_bilinear",
@@ -1288,7 +1279,7 @@ def create_clips(job_id, source, clip_length, export_format, start, end, caption
         "-filter_threads", str(FFMPEG_FILTER_THREADS),
         "-filter_complex_threads", str(FFMPEG_FILTER_THREADS),
         *(gop_args if gop_args else ["-force_key_frames", force_expr]),
-        *(["-c:a", "copy"] if str(info.get("audio_codec", "")).lower() == "aac" else ["-c:a", "aac", "-b:a", "128k"]),
+        *( ["-c:a", "copy"] if str(info.get("audio_codec", "")).lower() == "aac" else ["-c:a", "aac", "-b:a", "128k"] ),
         "-f", "segment", "-segment_time", f"{clip_length:.6f}",
         "-segment_time_delta", "0.02", "-reset_timestamps", "1",
     ]
@@ -1318,21 +1309,19 @@ def create_clips(job_id, source, clip_length, export_format, start, end, caption
         raise RuntimeError("Clip timing could not be made consistent. No partial result was returned.")
     return clips
 
-
 def render_result(job_id: str, source_info: dict[str, Any], source_name: str, clips: list[Path], thumb: Path, clip_length: float, start: float, total_duration: float) -> dict[str, Any]:
-    items = []
+    items=[]
     for index, clip in enumerate(clips):
-        duration = clip_length if index < len(clips) - 1 else max(0.001, total_duration - clip_length * (len(clips) - 1))
-        vtt_name = f"{clip.stem}.vtt"
+        duration = clip_length if index < len(clips)-1 else max(0.001, total_duration - clip_length*(len(clips)-1))
+        vtt_name=f"{clip.stem}.vtt"
         items.append({
-            "name": clip.name, "duration": round(duration, 3), "size": clip.stat().st_size,
-            "url": f"/api/jobs/{job_id}/download/{clip.name}",
-            "thumbnail": f"/api/jobs/{job_id}/thumbnail/{clip.name}",
-            "vtt": f"/api/jobs/{job_id}/captions/{vtt_name}",
-            "has_vtt": (JOBS_ROOT / job_id / vtt_name).is_file(),
+            "name":clip.name,"duration":round(duration,3),"size":clip.stat().st_size,
+            "url":f"/api/jobs/{job_id}/download/{clip.name}",
+            "thumbnail":f"/api/jobs/{job_id}/thumbnail/{clip.name}",
+            "vtt":f"/api/jobs/{job_id}/captions/{vtt_name}",
+            "has_vtt":(JOBS_ROOT/job_id/vtt_name).is_file(),
         })
-    return {"success": True, "job_id": job_id, "source_name": source_name, "source_duration": round(source_info["duration"], 2), "source_size": source_info["size"], "clip_count": len(items), "clips": items, "thumbnail": f"/api/jobs/{job_id}/source-thumb"}
-
+    return {"success":True,"job_id":job_id,"source_name":source_name,"source_duration":round(source_info["duration"],2),"source_size":source_info["size"],"clip_count":len(items),"clips":items,"thumbnail":f"/api/jobs/{job_id}/source-thumb"}
 
 def complete_job(job_id: str, source: Path, source_name: str, clip_length: float, export_format: str, start: float, end: float | None, captions: dict[str, Any] | None) -> None:
     try:
@@ -1380,8 +1369,7 @@ def recover_jobs_after_restart() -> None:
 
 
 def captions_from_form(enabled: bool, language: str, style: str, font: str, size: str, animation: str, position: str) -> dict[str, Any] | None:
-    if not enabled:
-        return None
+    if not enabled: return None
     return {"enabled": True, "language": language, "style": style, "font": font, "size": size, "animation": animation, "position": position}
 
 
@@ -1402,14 +1390,12 @@ def _detected_cpu_quota() -> float | None:
         pass
     return None
 
-
 def _render_cpu_count() -> float | None:
     try:
         value = os.getenv("RENDER_CPU_COUNT", "").strip()
         return float(value) if value else None
     except ValueError:
         return None
-
 
 def runtime_diagnostics() -> dict[str, Any]:
     return {
@@ -1526,8 +1512,7 @@ async def import_url(
     caption_animation: str = Form("none"),
     caption_position: str = Form("bottom"),
 ) -> dict[str, Any]:
-    rate_limit(request)
-    cleanup_old_jobs()
+    rate_limit(request); cleanup_old_jobs()
     url = (url or "").strip()
     length, export, start_v, end_v = validate_options(clip_length, export_format, start, end, export_quality, export_ratio)
     _validate_source_url(url)
@@ -1546,8 +1531,8 @@ async def import_url(
         source_url=url,
         clip_length=length,
         export_format=export,
-        export_quality=export.split(":", 1)[0],
-        export_ratio=export.split(":", 1)[1],
+        export_quality=export.split(":",1)[0],
+        export_ratio=export.split(":",1)[1],
         start=start_v,
         end=end_v,
         captions=captions_cfg,
@@ -1587,18 +1572,15 @@ async def upload(
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS and not (file.content_type or "").startswith("video/"):
         raise HTTPException(400, "Unsupported video format.")
-    if suffix not in SUPPORTED_EXTENSIONS:
-        suffix = ".mp4"
+    if suffix not in SUPPORTED_EXTENSIONS: suffix = ".mp4"
     job_id = uuid.uuid4().hex
-    job_dir = JOBS_ROOT / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+    job_dir = JOBS_ROOT / job_id; job_dir.mkdir(parents=True, exist_ok=True)
     source = job_dir / f"input{suffix}"
     total = 0
     with source.open("wb") as target:
         while True:
             chunk = await file.read(4 * 1024 * 1024)
-            if not chunk:
-                break
+            if not chunk: break
             total += len(chunk)
             if total > MAX_VIDEO_SIZE:
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -1625,9 +1607,7 @@ async def upload_chunk(request: Request) -> dict[str, Any]:
         job_id = session_id
     is_first = not bool(job_id)
     if is_first:
-        rate_limit(request)
-        cleanup_old_jobs()
-        job_id = uuid.uuid4().hex
+        rate_limit(request); cleanup_old_jobs(); job_id = uuid.uuid4().hex
     try:
         total_size = int(request.headers.get("X-Upload-Total", "0"))
         index = int(request.headers.get("X-Upload-Index", "-1"))
@@ -1645,9 +1625,7 @@ async def upload_chunk(request: Request) -> dict[str, Any]:
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise HTTPException(400, "Unsupported video format.")
-    job_dir = JOBS_ROOT / job_id
-    part = job_dir / "upload.part"
-    meta_path = job_dir / "upload.json"
+    job_dir = JOBS_ROOT / job_id; part = job_dir / "upload.part"; meta_path = job_dir / "upload.json"
     job_dir.mkdir(parents=True, exist_ok=True)
     lock = upload_locks.setdefault(job_id, asyncio.Lock())
     async with lock:
@@ -1655,31 +1633,15 @@ async def upload_chunk(request: Request) -> dict[str, Any]:
             if total_chunks > math.ceil(MAX_VIDEO_SIZE / requested_chunk_size):
                 raise HTTPException(400, "Too many upload chunks.")
             metadata = {
-                "filename": filename,
-                "total_size": total_size,
-                "total_chunks": total_chunks,
-                "chunk_size": requested_chunk_size,
-                "received": [],
-                "clip_length": request.headers.get("X-Upload-Clip-Length", "30"),
-                "export_format": request.headers.get("X-Upload-Export", "original"),
-                "export_quality": request.headers.get("X-Upload-Quality", "original"),
-                "export_ratio": request.headers.get("X-Upload-Ratio", "source"),
-                "start": request.headers.get("X-Upload-Start", "0"),
-                "end": request.headers.get("X-Upload-End", "0"),
+                "filename": filename, "total_size": total_size, "total_chunks": total_chunks, "chunk_size": requested_chunk_size, "received": [],
+                "clip_length": request.headers.get("X-Upload-Clip-Length", "30"), "export_format": request.headers.get("X-Upload-Export", "original"), "export_quality": request.headers.get("X-Upload-Quality", "original"), "export_ratio": request.headers.get("X-Upload-Ratio", "source"),
+                "start": request.headers.get("X-Upload-Start", "0"), "end": request.headers.get("X-Upload-End", "0"),
                 "captions": request.headers.get("X-Upload-Captions", "0") == "1",
-                "caption_language": request.headers.get("X-Upload-Caption-Language", "auto"),
-                "caption_style": request.headers.get("X-Upload-Caption-Style", "classic"),
-                "caption_font": request.headers.get("X-Upload-Caption-Font", "DejaVu Sans"),
-                "caption_size": request.headers.get("X-Upload-Caption-Size", "large"),
-                "caption_animation": request.headers.get("X-Upload-Caption-Animation", "none"),
-                "caption_position": request.headers.get("X-Upload-Caption-Position", "bottom"),
+                "caption_language": request.headers.get("X-Upload-Caption-Language", "auto"), "caption_style": request.headers.get("X-Upload-Caption-Style", "classic"),
+                "caption_font": request.headers.get("X-Upload-Caption-Font", "DejaVu Sans"), "caption_size": request.headers.get("X-Upload-Caption-Size", "large"),
+                "caption_animation": request.headers.get("X-Upload-Caption-Animation", "none"), "caption_position": request.headers.get("X-Upload-Caption-Position", "bottom"),
             }
-            validate_options(
-                metadata["clip_length"], metadata["export_format"],
-                metadata["start"], metadata["end"],
-                metadata.get("export_quality", "original"),
-                metadata.get("export_ratio", "source"),
-            )
+            validate_options(metadata["clip_length"], metadata["export_format"], metadata["start"], metadata["end"], metadata.get("export_quality","original"), metadata.get("export_ratio","source"))
             meta_tmp = meta_path.with_suffix(".json.tmp")
             meta_tmp.write_text(json.dumps(metadata), encoding="utf-8")
             os.replace(meta_tmp, meta_path)
@@ -1702,8 +1664,7 @@ async def upload_chunk(request: Request) -> dict[str, Any]:
             raise HTTPException(400, "Upload chunk metadata does not match the original upload.")
         if "X-Upload-Chunk-Size" in request.headers and requested_chunk_size != chunk_size:
             raise HTTPException(400, "Upload chunk size does not match the original upload session.")
-        offset = index * chunk_size
-        expected_chunk = min(chunk_size, total_size - offset)
+        offset = index * chunk_size; expected_chunk = min(chunk_size, total_size - offset)
         if offset >= total_size or expected_chunk <= 0:
             raise HTTPException(400, "Upload chunk offset is invalid.")
         received = {int(x) for x in metadata.get("received", [])}
@@ -1721,23 +1682,18 @@ async def upload_chunk(request: Request) -> dict[str, Any]:
             with part.open("r+b" if part.exists() else "w+b") as target:
                 target.seek(offset)
                 async for data in request.stream():
-                    if not data:
-                        continue
+                    if not data: continue
                     written += len(data)
-                    if written > expected_chunk:
-                        raise HTTPException(413, "Upload chunk is too large.")
+                    if written > expected_chunk: raise HTTPException(413, "Upload chunk is too large.")
                     target.write(data)
                 target.flush()
                 if UPLOAD_FSYNC:
                     os.fsync(target.fileno())
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(500, "Failed to store upload chunk.") from exc
+        except HTTPException: raise
+        except Exception as exc: raise HTTPException(500, "Failed to store upload chunk.") from exc
         if written != expected_chunk:
             raise HTTPException(400, f"Incomplete upload chunk: received {written} bytes, expected {expected_chunk}.")
-        received.add(index)
-        metadata["received"] = sorted(received)
+        received.add(index); metadata["received"] = sorted(received)
         meta_tmp = meta_path.with_suffix(".json.tmp")
         meta_tmp.write_text(json.dumps(metadata), encoding="utf-8")
         os.replace(meta_tmp, meta_path)
@@ -1753,35 +1709,16 @@ async def upload_chunk(request: Request) -> dict[str, Any]:
         if part.stat().st_size != total_size:
             raise HTTPException(400, "Upload is incomplete or corrupted.")
         try:
-            length, export, start_v, end_v = validate_options(
-                metadata["clip_length"], metadata["export_format"],
-                metadata["start"], metadata["end"],
-                metadata.get("export_quality", "original"),
-                metadata.get("export_ratio", "source"),
-            )
-            captions_cfg = captions_from_form(
-                metadata["captions"], metadata["caption_language"],
-                metadata["caption_style"], metadata["caption_font"],
-                metadata["caption_size"], metadata["caption_animation"],
-                metadata["caption_position"],
-            )
-            source = job_dir / f"input{suffix}"
-            part.replace(source)
-            meta_path.unlink(missing_ok=True)
-            update_job(
-                job_id, status="queued", progress=0, message="Upload complete. Queued.",
-                source_path=str(source), source_name=filename, clip_length=length,
-                export_format=export, start=start_v, end=end_v, captions=captions_cfg,
-            )
+            length, export, start_v, end_v = validate_options(metadata["clip_length"], metadata["export_format"], metadata["start"], metadata["end"], metadata.get("export_quality","original"), metadata.get("export_ratio","source"))
+            captions_cfg = captions_from_form(metadata["captions"], metadata["caption_language"], metadata["caption_style"], metadata["caption_font"], metadata["caption_size"], metadata["caption_animation"], metadata["caption_position"])
+            source = job_dir / f"input{suffix}"; part.replace(source); meta_path.unlink(missing_ok=True)
+            update_job(job_id, status="queued", progress=0, message="Upload complete. Queued.", source_path=str(source), source_name=filename, clip_length=length, export_format=export, start=start_v, end=end_v, captions=captions_cfg)
             executor.submit(run_job_from_upload, job_id, source, filename, length, export, start_v, end_v, captions_cfg)
             return {"job_id": job_id, "status_url": f"/api/jobs/{job_id}", "complete": True, "received": total_chunks}
-        except HTTPException:
-            raise
+        except HTTPException: raise
         except Exception:
-            log.exception("CHUNK_UPLOAD_FINALIZE_FAILED id=%s", job_id)
-            shutil.rmtree(job_dir, ignore_errors=True)
+            log.exception("CHUNK_UPLOAD_FINALIZE_FAILED id=%s", job_id); shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(500, "The upload could not be finalized.")
-
 
 @app.get("/api/upload-session/{job_id}")
 def upload_session(job_id: str) -> dict[str, Any]:
@@ -1792,18 +1729,16 @@ def upload_session(job_id: str) -> dict[str, Any]:
         if existing and existing.get("status") in {"queued", "processing", "complete"}:
             return {"job_id": job_id, "complete": True, "received": [], "total_chunks": 0}
         # A resumable client can legitimately hold a session id across a
-        # Render restart/redeploy. The old session data may be gone because
-        # the filesystem is ephemeral. Return an empty resumable state instead
+        # Render restart/redeploy.  The old session data may be gone because
+        # the filesystem is ephemeral.  Return an empty resumable state instead
         # of a 404 so the frontend can resend chunk 0 and recreate the session
-        # using the same id. This directly addresses the retry loop seen in
+        # using the same id.  This directly addresses the retry loop seen in
         # production after a deploy.
         if re.fullmatch(r"[0-9a-fA-F]{32}", job_id):
             return {"job_id": job_id, "complete": False, "received": [], "total_chunks": 0, "total_size": 0, "chunk_size": UPLOAD_CHUNK_SIZE, "received_bytes": 0, "next_missing": 0, "filename": "", "reset": True}
         raise HTTPException(400, "Invalid upload session.")
-    try:
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise HTTPException(500, "Upload session metadata is unreadable.") from exc
+    try: metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc: raise HTTPException(500, "Upload session metadata is unreadable.") from exc
     received = sorted({int(x) for x in metadata.get("received", [])})
     total_chunks = int(metadata.get("total_chunks", 0) or 0)
     total_size = int(metadata.get("total_size", 0) or 0)
@@ -1843,15 +1778,13 @@ async def batch(
     caption_animation: str = Form("none"),
     caption_position: str = Form("bottom"),
 ) -> dict[str, Any]:
-    rate_limit(request)
-    cleanup_old_jobs()
+    rate_limit(request); cleanup_old_jobs()
     if not 1 <= len(files) <= MAX_BATCH_FILES:
         raise HTTPException(400, f"Batch size must be between 1 and {MAX_BATCH_FILES} videos.")
-    results = []
-    request.state.batch_upload = True
+    results=[]; request.state.batch_upload=True
     for file in files:
         try:
-            result = await upload(
+            result=await upload(
                 request=request, file=file, clip_length=clip_length, export_format=export_format,
                 export_quality=export_quality, export_ratio=export_ratio, start="0", end="0",
                 captions=captions, caption_language=caption_language, caption_style=caption_style,
@@ -1860,32 +1793,28 @@ async def batch(
             )
             results.append(result)
         except HTTPException as exc:
-            results.append({"success": False, "filename": file.filename, "error": exc.detail})
-    return {"success": True, "jobs": results}
+            results.append({"success":False,"filename":file.filename,"error":exc.detail})
+    return {"success":True,"jobs":results}
 
 
 @app.post("/api/detect")
 async def detect(request: Request, file: UploadFile = File(...), clip_length: str = Form("30")) -> dict[str, Any]:
-    rate_limit(request)
-    cleanup_old_jobs()
+    rate_limit(request); cleanup_old_jobs()
     length, _, _, _ = validate_options(clip_length, "original", "0", "0")
     filename = safe_filename(file.filename or "video.mp4")
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         suffix = ".mp4"
     temp_id = uuid.uuid4().hex
-    job_dir = JOBS_ROOT / temp_id
-    job_dir.mkdir()
+    job_dir = JOBS_ROOT / temp_id; job_dir.mkdir()
     src = job_dir / f"input{suffix}"
     try:
         with src.open("wb") as target:
             while True:
                 chunk = await file.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
+                if not chunk: break
                 target.write(chunk)
-                if target.stat().st_size > MAX_VIDEO_SIZE:
-                    raise HTTPException(413, "Video exceeds the configured upload limit.")
+                if target.stat().st_size > MAX_VIDEO_SIZE: raise HTTPException(413, "Video exceeds the configured upload limit.")
         info = probe(src)
         # Fast scene scan on a low-FPS stream; candidate windows are later turned into real clips.
         result = run_checked([
@@ -1992,7 +1921,6 @@ def _recover_job_from_disk(job_id: str) -> dict[str, Any] | None:
         return recovered
     return None
 
-
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict[str, Any]:
     if not re.fullmatch(r"[0-9a-fA-F]{32}", job_id):
@@ -2032,8 +1960,7 @@ def source_thumb(job_id: str) -> FileResponse:
 
 @app.get("/api/jobs/{job_id}/thumbnail/{name}")
 def clip_thumb(job_id: str, name: str) -> FileResponse:
-    if "/" in name or "\\" in name:
-        raise HTTPException(400, "Invalid filename.")
+    if "/" in name or "\\" in name: raise HTTPException(400, "Invalid filename.")
     clip = JOBS_ROOT / job_id / "clips" / name
     if not clip.is_file() or clip.suffix.lower() != ".mp4":
         raise HTTPException(404, "Clip not found.")
@@ -2053,7 +1980,6 @@ def _safe_clip_path(job_id: str, name: str) -> Path:
     if not path.is_file() or path.stat().st_size <= 0:
         raise HTTPException(404, "Clip not found.")
     return path
-
 
 def _range_response(request: Request, path: Path, media_type: str, disposition: str = "inline", download_name: str | None = None):
     """Reliable large-file response with browser seeking and explicit disposition."""
@@ -2102,7 +2028,6 @@ def _range_response(request: Request, path: Path, media_type: str, disposition: 
         return StreamingResponse(iter(()), status_code=416, media_type=media_type, headers=headers)
 
     length = end_byte - start_byte + 1
-
     def iterator():
         with path.open("rb") as fh:
             fh.seek(start_byte)
@@ -2113,11 +2038,9 @@ def _range_response(request: Request, path: Path, media_type: str, disposition: 
                     break
                 remaining -= len(chunk)
                 yield chunk
-
     headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{size}"
     headers["Content-Length"] = str(length)
     return StreamingResponse(iterator(), status_code=206, media_type=media_type, headers=headers)
-
 
 @app.get("/api/jobs/{job_id}/media/{name}")
 def media(job_id: str, name: str, request: Request):
@@ -2156,6 +2079,7 @@ def download_caption(job_id: str, name: str) -> FileResponse:
     if not re.fullmatch(r"clip_\d{3}\.vtt", name or ""):
         raise HTTPException(400, "Invalid filename.")
     path = JOBS_ROOT / job_id / name
-    if not path.is_file():
-        raise HTTPException(404, "Caption sidecar not found.")
+    if not path.is_file(): raise HTTPException(404, "Caption sidecar not found.")
     return FileResponse(path, media_type="text/vtt", filename=path.name, headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
+
+
