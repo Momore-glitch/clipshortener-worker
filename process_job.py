@@ -88,15 +88,17 @@ def download_source():
 
 
 def b2_upload_file(path: Path, key: str, content_type: str):
-    """Stream an output to B2 while hashing it, avoiding a separate hash pass.
+    """Upload with an explicit length and precomputed SHA-1 checksum.
 
-    B2's native API supports X-Bz-Content-Sha1=hex_digits_at_end: the client
-    appends the computed 40-byte SHA-1 hex digest to the request body and sets
-    Content-Length to file size + 40. B2 verifies the checksum before accepting
-    the upload, so integrity checking is retained while avoiding a full extra
-    disk read before every output upload.
+    This restores the previously working B2 request format: a normal file
+    object, exact file Content-Length, and the full SHA-1 in the header.
+    The checksum pass costs one extra local read, but avoids the HTTP 400
+    produced by the recent generator-based hex_digits_at_end request.
     """
     size = path.stat().st_size
+    if size <= 0:
+        raise RuntimeError(f"Refusing to upload empty file: {path.name}")
+
     upload_started = time.monotonic()
 
     for attempt in range(1, 5):
@@ -113,28 +115,25 @@ def b2_upload_file(path: Path, key: str, content_type: str):
         info = upload_info_response.json()
 
         digest = hashlib.sha1()
-
-        def request_body():
-            with path.open("rb") as source:
-                for block in iter(lambda: source.read(UPLOAD_BLOCK_SIZE), b""):
-                    digest.update(block)
-                    yield block
-            # B2 expects the hexadecimal checksum as the final 40 body bytes.
-            yield digest.hexdigest().encode("ascii")
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(UPLOAD_BLOCK_SIZE), b""):
+                digest.update(block)
+        expected_sha1 = digest.hexdigest().lower()
 
         try:
-            response = requests.post(
-                info["uploadUrl"],
-                headers={
-                    "Authorization": info["authorizationToken"],
-                    "X-Bz-File-Name": quote(key, safe=""),
-                    "Content-Type": content_type,
-                    "Content-Length": str(size + 40),
-                    "X-Bz-Content-Sha1": "hex_digits_at_end",
-                },
-                data=request_body(),
-                timeout=(30, 1800),
-            )
+            with path.open("rb") as source:
+                response = requests.post(
+                    info["uploadUrl"],
+                    headers={
+                        "Authorization": info["authorizationToken"],
+                        "X-Bz-File-Name": quote(key, safe=""),
+                        "Content-Type": content_type,
+                        "Content-Length": str(size),
+                        "X-Bz-Content-Sha1": expected_sha1,
+                    },
+                    data=source,
+                    timeout=(30, 1800),
+                )
         except requests.RequestException:
             if attempt < 4:
                 continue
@@ -142,19 +141,23 @@ def b2_upload_file(path: Path, key: str, content_type: str):
 
         if response.ok:
             result = response.json()
-            local_sha1 = digest.hexdigest().lower()
             remote_sha1 = str(
-                result.get("contentSha1") or result.get("content_sha1") or ""
+                result.get("contentSha1")
+                or result.get("content_sha1")
+                or ""
             ).lower()
-            if remote_sha1 and remote_sha1 not in {"none", local_sha1}:
+
+            if remote_sha1 and remote_sha1 != expected_sha1:
                 raise RuntimeError(
                     f"B2 checksum mismatch for {path.name}: "
-                    f"local={local_sha1} remote={remote_sha1}"
+                    f"expected={expected_sha1} remote={remote_sha1}"
                 )
+
             elapsed = time.monotonic() - upload_started
             print(
                 f"B2_OUTPUT_UPLOAD_OK file={path.name} bytes={size} "
-                f"seconds={elapsed:.2f} sha1_verified={bool(remote_sha1 == local_sha1)}",
+                f"seconds={elapsed:.2f} "
+                f"sha1_verified={remote_sha1 == expected_sha1}",
                 flush=True,
             )
             return result
@@ -164,7 +167,9 @@ def b2_upload_file(path: Path, key: str, content_type: str):
                 continue
 
         raise RuntimeError(
-            f"B2 output upload failed: {response.status_code} {response.text[:1200]}"
+            f"B2 output upload failed: HTTP {response.status_code}; "
+            f"content_type={response.headers.get('Content-Type', '')}; "
+            f"response={response.text[:1000]}"
         )
 
     raise RuntimeError(f"B2 output upload failed after retries: {key}")
