@@ -1,3 +1,4 @@
+
 name: ClipShortener Processor
 
 on:
@@ -114,7 +115,7 @@ jobs:
           CLIPSHORTENER_X264_PARAMS: ""
           CLIPSHORTENER_UPLOAD_FSYNC: "0"
           CLIPSHORTENER_NO_UPSCALE: "1"
-          CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "0"
+          CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "1"
         run: python process_job.py
 
       - name: Report environment setup failure to ClipShortener
