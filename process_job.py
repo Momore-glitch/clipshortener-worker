@@ -42,10 +42,16 @@ def auth():
     bucket = next((b for b in allowed if b.get("name") == B2_BUCKET), None)
     if not bucket:
         raise RuntimeError(f"B2 bucket {B2_BUCKET!r} is not allowed to this key")
-    return data["authorizationToken"], storage["apiUrl"], storage["downloadUrl"], bucket["id"]
+    return (
+        data["authorizationToken"],
+        storage["apiUrl"],
+        storage["downloadUrl"],
+        bucket["id"],
+    )
 
 
 def status(state, progress=None, message=None, clips=None):
+    """Report worker progress with retries for transient network/server errors."""
     data = {"status": state}
     if progress is not None:
         data["progress"] = progress
@@ -54,16 +60,73 @@ def status(state, progress=None, message=None, clips=None):
     if clips is not None:
         data["clips"] = clips
 
-    response = requests.post(
-        f"{CONTROL_URL}/api/jobs/{JOB_ID}/worker-status",
-        headers={
-            "X-Worker-Secret": WORKER_SECRET,
-            "content-type": "application/json",
-        },
-        json=data,
-        timeout=30,
-    )
-    response.raise_for_status()
+    url = f"{CONTROL_URL}/api/jobs/{JOB_ID}/worker-status"
+    headers = {
+        "X-Worker-Secret": WORKER_SECRET,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    retryable = {408, 429, 500, 502, 503, 504}
+    max_attempts = 5
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=data,
+                timeout=30,
+            )
+
+            if response.status_code not in retryable:
+                response.raise_for_status()
+                return
+
+            last_error = requests.HTTPError(
+                f"HTTP {response.status_code}: {response.text[:300]}",
+                response=response,
+            )
+
+        except requests.RequestException as exc:
+            last_error = exc
+            response = getattr(exc, "response", None)
+
+            # Authentication and other permanent client errors should not
+            # be retried repeatedly.
+            if (
+                response is not None
+                and response.status_code not in retryable
+            ):
+                raise
+
+        if attempt < max_attempts:
+            delay = min(2 ** (attempt - 1), 8)
+            print(
+                f"WORKER_STATUS_RETRY attempt={attempt}/{max_attempts} "
+                f"state={state} retry_in={delay}s "
+                f"error={str(last_error)[:250]}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+    # Intermediate status updates should not kill otherwise healthy
+    # processing when the status server is temporarily unavailable.
+    if state not in {"complete", "error"}:
+        print(
+            f"WORKER_STATUS_WARNING state={state} "
+            f"error={str(last_error)[:500]}; continuing processing",
+            flush=True,
+        )
+        return
+
+    # The final status is essential. Do not report success locally if the
+    # website cannot be notified that the completed clips are ready.
+    raise RuntimeError(
+        f"Final worker status '{state}' failed after "
+        f"{max_attempts} attempts: {last_error}"
+    ) from last_error
 
 
 def download_source():
@@ -88,13 +151,7 @@ def download_source():
 
 
 def b2_upload_file(path: Path, key: str, content_type: str):
-    """Upload with an explicit length and precomputed SHA-1 checksum.
-
-    This restores the previously working B2 request format: a normal file
-    object, exact file Content-Length, and the full SHA-1 in the header.
-    The checksum pass costs one extra local read, but avoids the HTTP 400
-    produced by the recent generator-based hex_digits_at_end request.
-    """
+    """Upload a file to B2 with explicit length and SHA-1 verification."""
     size = path.stat().st_size
     if size <= 0:
         raise RuntimeError(f"Refusing to upload empty file: {path.name}")
@@ -116,7 +173,10 @@ def b2_upload_file(path: Path, key: str, content_type: str):
 
         digest = hashlib.sha1()
         with path.open("rb") as source:
-            for block in iter(lambda: source.read(UPLOAD_BLOCK_SIZE), b""):
+            for block in iter(
+                lambda: source.read(UPLOAD_BLOCK_SIZE),
+                b"",
+            ):
                 digest.update(block)
         expected_sha1 = digest.hexdigest().lower()
 
@@ -136,6 +196,7 @@ def b2_upload_file(path: Path, key: str, content_type: str):
                 )
         except requests.RequestException:
             if attempt < 4:
+                time.sleep(min(attempt, 3))
                 continue
             raise
 
@@ -164,6 +225,7 @@ def b2_upload_file(path: Path, key: str, content_type: str):
 
         if response.status_code in (401,) or response.status_code >= 500:
             if attempt < 4:
+                time.sleep(min(attempt, 3))
                 continue
 
         raise RuntimeError(
@@ -188,7 +250,11 @@ def upload_one(path: Path, job_dir: Path):
         "duration": round(float(info["duration"]), 2),
         "size": path.stat().st_size,
         "url": f"{CONTROL_URL}/api/jobs/{JOB_ID}/download/{path.name}",
-        "vtt": f"{CONTROL_URL}/api/jobs/{JOB_ID}/captions/{vtt_path.name}" if vtt_path.is_file() else "",
+        "vtt": (
+            f"{CONTROL_URL}/api/jobs/{JOB_ID}/captions/{vtt_path.name}"
+            if vtt_path.is_file()
+            else ""
+        ),
         "has_vtt": vtt_path.is_file(),
     }
 
@@ -201,10 +267,17 @@ def upload_outputs():
     clips = sorted(outdir.glob("clip_*.mp4"))
     vtts = sorted(job_dir.glob("*.vtt"))
 
+    if not clips:
+        raise RuntimeError("No clips were available for output upload.")
+
     results = []
     workers = min(4, max(1, len(clips)))
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(upload_one, path, job_dir) for path in clips]
+        futures = [
+            pool.submit(upload_one, path, job_dir)
+            for path in clips
+        ]
         for future in as_completed(futures):
             results.append(future.result())
 
@@ -221,14 +294,17 @@ def upload_outputs():
 
 def main():
     job_started = time.monotonic()
+
     status("processing", 1, "Processing worker started.")
     status("processing", 5, "Downloading source from B2...")
 
     download_started = time.monotonic()
     download_source()
     download_seconds = time.monotonic() - download_started
+
     print(
-        f"PHASE_DOWNLOAD seconds={download_seconds:.2f} bytes={SOURCE.stat().st_size}",
+        f"PHASE_DOWNLOAD seconds={download_seconds:.2f} "
+        f"bytes={SOURCE.stat().st_size}",
         flush=True,
     )
 
@@ -236,6 +312,7 @@ def main():
     import app
 
     info = app.probe(SOURCE)
+
     print(
         "SOURCE_PROFILE "
         f"bytes={SOURCE.stat().st_size} duration={info['duration']:.3f} "
@@ -243,6 +320,7 @@ def main():
         f"avg_fps={info['avg_frame_rate']} r_fps={info['r_frame_rate']}",
         flush=True,
     )
+
     status("processing", 16, "Creating clips...")
 
     encode_started = time.monotonic()
@@ -261,28 +339,43 @@ def main():
     if not clips:
         raise RuntimeError("No clips were produced.")
 
-    output_bytes = sum(path.stat().st_size for path in clips if path.is_file())
+    output_bytes = sum(
+        path.stat().st_size for path in clips if path.is_file()
+    )
+
     print(
-        f"PHASE_CLIP_PROCESS seconds={encode_seconds:.2f} clips={len(clips)} "
-        f"output_bytes={output_bytes}",
+        f"PHASE_CLIP_PROCESS seconds={encode_seconds:.2f} "
+        f"clips={len(clips)} output_bytes={output_bytes}",
         flush=True,
     )
 
-    status("processing", 80, f"Uploading {len(clips)} finished clips...")
+    status(
+        "processing",
+        80,
+        f"Uploading {len(clips)} finished clips...",
+    )
+
     upload_started = time.monotonic()
     result = upload_outputs()
     upload_seconds = time.monotonic() - upload_started
+
     print(
-        f"PHASE_OUTPUT_UPLOAD seconds={upload_seconds:.2f} clips={len(result)} "
+        f"PHASE_OUTPUT_UPLOAD seconds={upload_seconds:.2f} "
+        f"clips={len(result)} "
         f"output_bytes={sum(int(item.get('size') or 0) for item in result)}",
         flush=True,
     )
 
+    # Include the clip list in the terminal status so the website can
+    # display the individual downloadable output files.
     status("complete", 100, "Your clips are ready.", result)
+
     print(
         f"PHASE_JOB_TOTAL seconds={time.monotonic() - job_started:.2f} "
-        f"download_seconds={download_seconds:.2f} encode_seconds={encode_seconds:.2f} "
-        f"output_upload_seconds={upload_seconds:.2f} input_bytes={SOURCE.stat().st_size} "
+        f"download_seconds={download_seconds:.2f} "
+        f"encode_seconds={encode_seconds:.2f} "
+        f"output_upload_seconds={upload_seconds:.2f} "
+        f"input_bytes={SOURCE.stat().st_size} "
         f"output_bytes={sum(int(item.get('size') or 0) for item in result)} "
         f"clips={len(result)}",
         flush=True,
@@ -298,5 +391,9 @@ if __name__ == "__main__":
         print(f"WORKER FAILED: {exc}", file=sys.stderr)
         try:
             status("error", 0, str(exc)[:700])
-        finally:
-            raise
+        except Exception as status_exc:
+            print(
+                f"WORKER_ERROR_STATUS_FAILED: {status_exc}",
+                file=sys.stderr,
+            )
+        raise
