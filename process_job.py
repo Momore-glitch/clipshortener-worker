@@ -41,7 +41,7 @@ def auth():
     allowed = storage.get("allowed", {}).get("buckets", [])
     bucket = next((b for b in allowed if b.get("name") == B2_BUCKET), None)
     if not bucket:
-        raise RuntimeError(f"B2 bucket {B2_BUCKET!r} is not allowed to this key")
+        raise RuntimeError(f"B2 bucket {B2_BUCKET!r} is not allowed to this application key")
     return (
         data["authorizationToken"],
         storage["apiUrl"],
@@ -130,24 +130,79 @@ def status(state, progress=None, message=None, clips=None):
 
 
 def download_source():
-    token, _, download_url, _ = auth()
-    key = PAYLOAD["source_key"]
-    encoded = "/".join(quote(part, safe="") for part in key.split("/"))
-    url = f"{download_url}/file/{quote(B2_BUCKET, safe='')}/{encoded}"
+    """Stream the private source via Cloudflare rather than directly from B2.
 
+    B2 direct downloads from a GitHub-hosted runner can exhaust the account's
+    daily download cap. The authenticated Cloudflare Worker route streams the
+    file without buffering the multi-gigabyte source in memory.
+    """
+    url = f"{CONTROL_URL}/api/jobs/{quote(JOB_ID, safe='')}/source"
+    headers = {
+        "X-Worker-Secret": WORKER_SECRET,
+        "Accept": "application/octet-stream",
+        "Accept-Encoding": "identity",
+    }
     temp = SOURCE.with_suffix(SOURCE.suffix + ".part")
-    with requests.get(
-        url,
-        headers={"Authorization": token},
-        stream=True,
-        timeout=(30, 1800),
-    ) as response:
-        response.raise_for_status()
-        with temp.open("wb") as out:
-            for block in response.iter_content(chunk_size=UPLOAD_BLOCK_SIZE):
-                if block:
+
+    try:
+        expected_size = int(PAYLOAD.get("total_size") or 0)
+        downloaded = 0
+
+        with requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=(30, 1800),
+        ) as response:
+            if not response.ok:
+                detail = response.text[:1200]
+                raise RuntimeError(
+                    f"Cloudflare source proxy failed: HTTP {response.status_code}: {detail}"
+                )
+
+            content_length = response.headers.get("Content-Length")
+            if content_length and expected_size > 0:
+                try:
+                    declared_size = int(content_length)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Source proxy returned invalid Content-Length: {content_length!r}"
+                    ) from exc
+                if declared_size != expected_size:
+                    raise RuntimeError(
+                        "Source proxy length mismatch: "
+                        f"expected={expected_size} declared={declared_size}"
+                    )
+
+            with temp.open("wb") as out:
+                for block in response.iter_content(chunk_size=UPLOAD_BLOCK_SIZE):
+                    if not block:
+                        continue
+                    downloaded += len(block)
+                    if expected_size > 0 and downloaded > expected_size:
+                        raise RuntimeError(
+                            "Source proxy sent more data than expected: "
+                            f"expected={expected_size} received_at_least={downloaded}"
+                        )
                     out.write(block)
-    temp.replace(SOURCE)
+
+        if downloaded <= 0:
+            raise RuntimeError("Cloudflare source proxy returned an empty video.")
+        if expected_size > 0 and downloaded != expected_size:
+            raise RuntimeError(
+                f"Source proxy download was incomplete: "
+                f"expected={expected_size} received={downloaded}"
+            )
+
+        temp.replace(SOURCE)
+        print(
+            f"SOURCE_PROXY_DOWNLOAD_OK bytes={downloaded} "
+            f"expected_bytes={expected_size or 'unknown'}",
+            flush=True,
+        )
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
 
 
 def b2_upload_file(path: Path, key: str, content_type: str):
@@ -296,7 +351,7 @@ def main():
     job_started = time.monotonic()
 
     status("processing", 1, "Processing worker started.")
-    status("processing", 5, "Downloading source from B2...")
+    status("processing", 5, "Downloading source through Cloudflare...")
 
     download_started = time.monotonic()
     download_source()
