@@ -326,22 +326,42 @@ def upload_outputs():
         raise RuntimeError("No clips were available for output upload.")
 
     results = []
-    workers = min(4, max(1, len(clips)))
+    clip_workers = min(4, max(1, len(clips)))
+    vtt_workers = min(4, len(vtts))
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(upload_one, path, job_dir)
-            for path in clips
-        ]
-        for future in as_completed(futures):
-            results.append(future.result())
-
-    for path in vtts:
+    def upload_vtt(path: Path):
         b2_upload_file(
             path,
             f"jobs/{JOB_ID}/captions/{path.name}",
             "text/vtt; charset=utf-8",
         )
+
+    # Upload videos and caption files concurrently.
+    with ThreadPoolExecutor(
+        max_workers=max(1, clip_workers + vtt_workers)
+    ) as pool:
+        clip_futures = [
+            pool.submit(upload_one, path, job_dir)
+            for path in clips
+        ]
+
+        vtt_futures = [
+            pool.submit(upload_vtt, path)
+            for path in vtts
+        ]
+
+        for future in as_completed(clip_futures):
+            results.append(future.result())
+
+        for future in as_completed(vtt_futures):
+            future.result()
+
+    print(
+        f"OUTPUT_UPLOAD_CONCURRENCY clips={len(clips)} "
+        f"clip_workers={clip_workers} "
+        f"captions={len(vtts)} caption_workers={vtt_workers}",
+        flush=True,
+    )
 
     results.sort(key=lambda item: item["name"])
     return results
