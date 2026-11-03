@@ -1,0 +1,122 @@
+name: Clean unfinished Backblaze uploads
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_cancel:
+        description: 'Cancel every unfinished large-file upload in the dedicated clipshortener-media bucket'
+        required: true
+        type: choice
+        options:
+          - no
+          - yes_cancel_unfinished
+        default: no
+
+jobs:
+  cleanup:
+    if: ${{ inputs.confirm_cancel == 'yes_cancel_unfinished' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: List and cancel unfinished large uploads
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          key_id = os.environ["B2_KEY_ID"].strip()
+          app_key = os.environ["B2_APPLICATION_KEY"].strip()
+          bucket_name = os.environ["B2_BUCKET"].strip()
+          if bucket_name != "clipshortener-media":
+              raise SystemExit(
+                  "Safety stop: B2_BUCKET is not clipshortener-media. "
+                  "No uploads were changed."
+              )
+
+          basic = base64.b64encode(
+              f"{key_id}:{app_key}".encode("utf-8")
+          ).decode("ascii")
+          auth_request = urllib.request.Request(
+              "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+              headers={"Authorization": f"Basic {basic}", "Accept": "application/json"},
+          )
+
+          def read_json(request):
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")[:1000]
+                  raise RuntimeError(f"Backblaze HTTP {error.code}: {detail}") from error
+
+          auth = read_json(auth_request)
+          token = auth["authorizationToken"]
+          storage = auth["apiInfo"]["storageApi"]
+          api_url = storage["apiUrl"].rstrip("/")
+          bucket = next(
+              (item for item in storage.get("allowed", {}).get("buckets", [])
+               if item.get("name") == bucket_name),
+              None,
+          )
+          if not bucket:
+              raise SystemExit(
+                  "The configured B2 key cannot access clipshortener-media. "
+                  "No uploads were changed."
+              )
+
+          unfinished = []
+          start_file_id = None
+          while True:
+              params = {"bucketId": bucket["id"], "maxFileCount": 100}
+              if start_file_id:
+                  params["startFileId"] = start_file_id
+              url = api_url + "/b2api/v4/b2_list_unfinished_large_files?" + urllib.parse.urlencode(params)
+              request = urllib.request.Request(
+                  url, headers={"Authorization": token, "Accept": "application/json"}
+              )
+              page = read_json(request)
+              unfinished.extend(
+                  item for item in page.get("files", []) if item.get("action") == "start"
+              )
+              next_file_id = page.get("nextFileId")
+              if not next_file_id or next_file_id == start_file_id:
+                  break
+              start_file_id = next_file_id
+
+          print(f"UNFINISHED_UPLOADS_FOUND={len(unfinished)}")
+          if not unfinished:
+              print("Nothing to cancel. The bucket has no unfinished large uploads.")
+              raise SystemExit(0)
+
+          cancelled = 0
+          for item in unfinished:
+              file_id = item.get("fileId")
+              if not file_id:
+                  print(f"SKIPPED missing fileId: {item.get('fileName', '(unnamed)')}")
+                  continue
+              body = json.dumps({"fileId": file_id}).encode("utf-8")
+              request = urllib.request.Request(
+                  api_url + "/b2api/v4/b2_cancel_large_file",
+                  data=body,
+                  method="POST",
+                  headers={
+                      "Authorization": token,
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                  },
+              )
+              result = read_json(request)
+              cancelled += 1
+              print(f"CANCELLED: {result.get('fileName', item.get('fileName', '(unnamed)'))}")
+
+          print(f"UNFINISHED_UPLOADS_CANCELLED={cancelled}")
+          print("Completed files were not touched.")
+          PY
