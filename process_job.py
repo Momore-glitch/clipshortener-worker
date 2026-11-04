@@ -26,6 +26,9 @@ JOBDIR = ROOT / "job"
 JOBDIR.mkdir(parents=True, exist_ok=True)
 SOURCE = JOBDIR / PAYLOAD.get("filename", "input.mp4")
 UPLOAD_BLOCK_SIZE = 16 * 1024 * 1024
+SOURCE_RANGE_SIZE = 64 * 1024 * 1024
+SOURCE_RANGE_ATTEMPTS = 5
+SOURCE_RANGE_RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 
 def auth():
@@ -130,11 +133,13 @@ def status(state, progress=None, message=None, clips=None):
 
 
 def download_source():
-    """Stream the private source via Cloudflare rather than directly from B2.
+    """Download the private source through Cloudflare using verified byte ranges.
 
-    B2 direct downloads from a GitHub-hosted runner can exhaust the account's
-    daily download cap. The authenticated Cloudflare Worker route streams the
-    file without buffering the multi-gigabyte source in memory.
+    A single multi-gigabyte HTTP response proved vulnerable to mid-stream
+    connection resets. The Cloudflare Worker already forwards Range requests
+    to B2 and streams each response, so use bounded range requests with
+    per-range retries. Failed ranges are discarded and retried without losing
+    previously completed ranges during this processor run.
     """
     url = f"{CONTROL_URL}/api/jobs/{quote(JOB_ID, safe='')}/source"
     headers = {
@@ -144,60 +149,188 @@ def download_source():
     }
     temp = SOURCE.with_suffix(SOURCE.suffix + ".part")
 
-    try:
-        expected_size = int(PAYLOAD.get("total_size") or 0)
-        downloaded = 0
+    expected_size = int(PAYLOAD.get("total_size") or 0)
+    if expected_size <= 0:
+        try:
+            head = requests.head(
+                url,
+                headers=headers,
+                timeout=(30, 60),
+                allow_redirects=False,
+            )
+            head.raise_for_status()
+            expected_size = int(head.headers.get("Content-Length") or 0)
+        except (requests.RequestException, ValueError) as exc:
+            raise RuntimeError(
+                "Could not determine source size from the Cloudflare source proxy."
+            ) from exc
 
-        with requests.get(
-            url,
-            headers=headers,
-            stream=True,
-            timeout=(30, 1800),
-        ) as response:
-            if not response.ok:
-                detail = response.text[:1200]
-                raise RuntimeError(
-                    f"Cloudflare source proxy failed: HTTP {response.status_code}: {detail}"
+    if expected_size <= 0:
+        raise RuntimeError("The source payload did not contain a valid video size.")
+
+    temp.unlink(missing_ok=True)
+    started_at = time.monotonic()
+    completed_bytes = 0
+    last_status_bucket = 0
+
+    try:
+        with temp.open("w+b") as out:
+            offset = 0
+            while offset < expected_size:
+                end = min(offset + SOURCE_RANGE_SIZE, expected_size) - 1
+                expected_range_bytes = end - offset + 1
+                last_error = None
+                range_started = time.monotonic()
+
+                for attempt in range(1, SOURCE_RANGE_ATTEMPTS + 1):
+                    received_this_attempt = 0
+                    try:
+                        range_headers = {
+                            **headers,
+                            "Range": f"bytes={offset}-{end}",
+                        }
+
+                        with requests.get(
+                            url,
+                            headers=range_headers,
+                            stream=True,
+                            timeout=(30, 180),
+                        ) as response:
+                            if response.status_code != 206:
+                                # Do not read response.text here: if a proxy
+                                # ignores Range and returns HTTP 200, the body
+                                # could be the entire multi-gigabyte source.
+                                if response.status_code in SOURCE_RANGE_RETRYABLE_STATUSES:
+                                    raise requests.HTTPError(
+                                        f"Retryable source range HTTP "
+                                        f"{response.status_code}",
+                                        response=response,
+                                    )
+
+                                raise RuntimeError(
+                                    f"Cloudflare source range request expected HTTP 206 "
+                                    f"but received HTTP {response.status_code}."
+                                )
+
+                            content_range = response.headers.get("Content-Range", "")
+                            expected_content_range = (
+                                f"bytes {offset}-{end}/{expected_size}"
+                            )
+                            if content_range.strip() != expected_content_range:
+                                raise RuntimeError(
+                                    "Cloudflare returned an incorrect Content-Range: "
+                                    f"expected={expected_content_range!r} "
+                                    f"received={content_range!r}"
+                                )
+
+                            declared_length = response.headers.get("Content-Length")
+                            if declared_length:
+                                try:
+                                    declared_length = int(declared_length)
+                                except ValueError as exc:
+                                    raise RuntimeError(
+                                        "Cloudflare source range returned an invalid "
+                                        f"Content-Length: {declared_length!r}"
+                                    ) from exc
+                                if declared_length != expected_range_bytes:
+                                    raise RuntimeError(
+                                        "Cloudflare source range length mismatch: "
+                                        f"expected={expected_range_bytes} "
+                                        f"declared={declared_length}"
+                                    )
+
+                            out.seek(offset)
+                            for block in response.iter_content(
+                                chunk_size=UPLOAD_BLOCK_SIZE
+                            ):
+                                if not block:
+                                    continue
+                                received_this_attempt += len(block)
+                                if received_this_attempt > expected_range_bytes:
+                                    raise RuntimeError(
+                                        "Cloudflare sent more bytes than requested "
+                                        f"for range {offset}-{end}."
+                                    )
+                                out.write(block)
+
+                        if received_this_attempt != expected_range_bytes:
+                            raise requests.exceptions.ChunkedEncodingError(
+                                "Incomplete source range: "
+                                f"expected={expected_range_bytes} "
+                                f"received={received_this_attempt}"
+                            )
+
+                        last_error = None
+                        break
+
+                    except requests.RequestException as exc:
+                        last_error = exc
+                    except RuntimeError as exc:
+                        # Retry only explicitly transient HTTP responses. A
+                        # malformed Content-Range or other permanent response
+                        # must fail clearly rather than risk corrupting a file.
+                        last_error = exc
+                        if "Retryable source range HTTP" not in str(exc):
+                            raise
+
+                    # Discard partial bytes from this attempt before retrying.
+                    out.seek(offset)
+                    out.truncate(offset)
+
+                    if attempt < SOURCE_RANGE_ATTEMPTS:
+                        delay = min(2 ** (attempt - 1), 16)
+                        print(
+                            f"SOURCE_RANGE_RETRY range={offset}-{end} "
+                            f"attempt={attempt}/{SOURCE_RANGE_ATTEMPTS} "
+                            f"retry_in={delay}s error={str(last_error)[:300]}",
+                            flush=True,
+                        )
+                        time.sleep(delay)
+
+                if last_error is not None:
+                    raise RuntimeError(
+                        f"Source range {offset}-{end} failed after "
+                        f"{SOURCE_RANGE_ATTEMPTS} attempts: {last_error}"
+                    ) from last_error
+
+                completed_bytes += expected_range_bytes
+                range_seconds = time.monotonic() - range_started
+                percent = completed_bytes * 100.0 / expected_size
+                print(
+                    f"SOURCE_RANGE_OK start={offset} end={end} "
+                    f"bytes={expected_range_bytes} seconds={range_seconds:.2f} "
+                    f"progress={percent:.1f}%",
+                    flush=True,
                 )
 
-            content_length = response.headers.get("Content-Length")
-            if content_length and expected_size > 0:
-                try:
-                    declared_size = int(content_length)
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"Source proxy returned invalid Content-Length: {content_length!r}"
-                    ) from exc
-                if declared_size != expected_size:
-                    raise RuntimeError(
-                        "Source proxy length mismatch: "
-                        f"expected={expected_size} declared={declared_size}"
+                status_bucket = completed_bytes // (512 * 1024 * 1024)
+                if status_bucket > last_status_bucket:
+                    last_status_bucket = status_bucket
+                    status(
+                        "processing",
+                        5,
+                        f"Downloading source through Cloudflare... "
+                        f"{completed_bytes * 100 // expected_size}%",
                     )
 
-            with temp.open("wb") as out:
-                for block in response.iter_content(chunk_size=UPLOAD_BLOCK_SIZE):
-                    if not block:
-                        continue
-                    downloaded += len(block)
-                    if expected_size > 0 and downloaded > expected_size:
-                        raise RuntimeError(
-                            "Source proxy sent more data than expected: "
-                            f"expected={expected_size} received_at_least={downloaded}"
-                        )
-                    out.write(block)
+                offset = end + 1
 
-        if downloaded <= 0:
-            raise RuntimeError("Cloudflare source proxy returned an empty video.")
-        if expected_size > 0 and downloaded != expected_size:
+            out.flush()
+            os.fsync(out.fileno())
+
+        actual_size = temp.stat().st_size
+        if actual_size != expected_size:
             raise RuntimeError(
-                f"Source proxy download was incomplete: "
-                f"expected={expected_size} received={downloaded}"
+                f"Source proxy download size mismatch: "
+                f"expected={expected_size} received={actual_size}"
             )
 
         temp.replace(SOURCE)
         print(
-            f"SOURCE_PROXY_DOWNLOAD_OK bytes={downloaded} "
-            f"expected_bytes={expected_size or 'unknown'}",
+            f"SOURCE_PROXY_DOWNLOAD_OK bytes={actual_size} "
+            f"expected_bytes={expected_size} "
+            f"range_size={SOURCE_RANGE_SIZE} "
+            f"seconds={time.monotonic() - started_at:.2f}",
             flush=True,
         )
     except Exception:
