@@ -1,0 +1,173 @@
+name: Reprocess existing ClipShortener source (full-length validation)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_full_run:
+        description: 'Process the complete existing 4.86 GB source into 120-second clips'
+        required: true
+        type: choice
+        options:
+          - no
+          - yes_process_full_source
+        default: no
+      job_payload_json:
+        description: 'Saved source job details. Leave the default JSON unchanged.'
+        required: true
+        type: string
+        default: '{"job":{"captions":null,"chunk_size":16777216,"clip_length":120,"end":null,"export_format":"1080:9:16","export_quality":"1080","export_ratio":"9:16","filename":"Nice_Waffentrager_game_2026.10.24_-_13.51.57.00.mp4","id":"f0e358545bfb43cea75cbdd430af0dae","source_file_id":"4_z47b5d053888fbae4aa0b0410_f20065495954d2049_d20261104_m185346_c005_v0501040_t0030_u01793818426995","source_key":"jobs/f0e358545bfb43cea75cbdd430af0dae/source/Nice_Waffentrager_game_2026.10.24_-_13.51.57.00.mp4","start":0,"total_chunks":290,"total_size":4860702991}}'
+
+jobs:
+  reprocess:
+    if: ${{ inputs.confirm_full_run == 'yes_process_full_source' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out worker
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-worker.txt
+
+      - name: Install FFmpeg and Python dependencies
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --disable-pip-version-check -r requirements-worker.txt
+
+      - name: Verify exact saved source and storage headroom
+        env:
+          JOB_PAYLOAD_INPUT: ${{ inputs.job_payload_json }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          raw = json.loads(os.environ["JOB_PAYLOAD_INPUT"])
+          job = raw.get("job", raw)
+          expected = {
+              "id": "f0e358545bfb43cea75cbdd430af0dae",
+              "source_file_id": "4_z47b5d053888fbae4aa0b0410_f20065495954d2049_d20261104_m185346_c005_v0501040_t0030_u01793818426995",
+              "source_key": "jobs/f0e358545bfb43cea75cbdd430af0dae/source/Nice_Waffentrager_game_2026.10.24_-_13.51.57.00.mp4",
+              "total_size": 4860702991,
+              "filename": "Nice_Waffentrager_game_2026.10.24_-_13.51.57.00.mp4",
+          }
+          for key, value in expected.items():
+              actual = job.get(key)
+              if key == "total_size":
+                  actual = int(actual or 0)
+              if actual != value:
+                  raise SystemExit(f"Safety stop: saved source {key} does not match the verified 4.86 GB source.")
+
+          if job.get("end") is not None or float(job.get("clip_length") or 0) != 120:
+              raise SystemExit("Safety stop: expected full source (end=null) and 120-second clips.")
+          if float(job.get("start") or 0) != 0 or job.get("captions"):
+              raise SystemExit("Safety stop: expected start=0 and captions disabled for this validation.")
+          if os.environ["B2_BUCKET"].strip() != "clipshortener-media":
+              raise SystemExit("Safety stop: configured B2 bucket is not clipshortener-media.")
+
+          key_id = os.environ["B2_KEY_ID"].strip()
+          app_key = os.environ["B2_APPLICATION_KEY"].strip()
+          basic = base64.b64encode(f"{key_id}:{app_key}".encode()).decode("ascii")
+          auth_request = urllib.request.Request(
+              "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+              headers={"Authorization": f"Basic {basic}", "Accept": "application/json"},
+          )
+
+          def read_json(request):
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode("utf-8", "replace")[:1000]
+                  raise RuntimeError(f"Backblaze HTTP {error.code}: {detail}") from error
+
+          auth = read_json(auth_request)
+          storage = auth["apiInfo"]["storageApi"]
+          api_url = storage["apiUrl"].rstrip("/")
+          token = auth["authorizationToken"]
+          bucket = next(
+              (item for item in storage.get("allowed", {}).get("buckets", [])
+               if item.get("name") == "clipshortener-media"),
+              None,
+          )
+          if not bucket:
+              raise SystemExit("B2 credentials cannot access clipshortener-media.")
+
+          info_request = urllib.request.Request(
+              api_url + "/b2api/v4/b2_get_file_info",
+              data=json.dumps({"fileId": expected["source_file_id"]}).encode(),
+              method="POST",
+              headers={"Authorization": token, "Content-Type": "application/json", "Accept": "application/json"},
+          )
+          info = read_json(info_request)
+          if info.get("fileName") != expected["source_key"] or int(info.get("contentLength") or 0) != expected["total_size"]:
+              raise SystemExit("Safety stop: Backblaze source file ID, path, or size did not match.")
+
+          stored_bytes = 0
+          version_count = 0
+          start_name = None
+          start_id = None
+          while True:
+              params = {"bucketId": bucket["id"], "maxFileCount": 1000}
+              if start_name:
+                  params["startFileName"] = start_name
+              if start_id:
+                  params["startFileId"] = start_id
+              url = api_url + "/b2api/v4/b2_list_file_versions?" + urllib.parse.urlencode(params)
+              page = read_json(urllib.request.Request(url, headers={"Authorization": token, "Accept": "application/json"}))
+              for version in page.get("files", []):
+                  if version.get("action") == "upload":
+                      stored_bytes += int(version.get("contentLength") or 0)
+                      version_count += 1
+              next_name, next_id = page.get("nextFileName"), page.get("nextFileId")
+              if not next_name or not next_id or (next_name, next_id) == (start_name, start_id):
+                  break
+              start_name, start_id = next_name, next_id
+
+          print("EXISTING_SOURCE_CONFIRMED=YES")
+          print("SOURCE_BYTES:", expected["total_size"])
+          print("BUCKET_STORED_VERSION_BYTES:", stored_bytes)
+          print("BUCKET_STORED_VERSION_COUNT:", version_count)
+          print("PROCESSING_WINDOW=FULL_SOURCE")
+          print("EXPECTED_CLIPS=16")
+          if stored_bytes >= 9_000_000_000:
+              raise SystemExit("Storage preflight stopped: bucket version storage is at least 9 GB. No processing or output upload was started.")
+
+          payload = json.dumps(raw, separators=(",", ":"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"JOB_ID={expected['id']}\n")
+              env_file.write(f"JOB_PAYLOAD={payload}\n")
+          PY
+
+      - name: Reprocess full source using retryable byte-range downloads
+        timeout-minutes: 80
+        env:
+          CONTROL_URL: ${{ secrets.CONTROL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          CLIPSHORTENER_FFMPEG_THREADS: "0"
+          CLIPSHORTENER_FILTER_THREADS: "4"
+          CLIPSHORTENER_FFMPEG_PRESET: "ultrafast"
+          CLIPSHORTENER_FFMPEG_TUNE: ""
+          CLIPSHORTENER_X264_PARAMS: ""
+          CLIPSHORTENER_UPLOAD_FSYNC: "0"
+          CLIPSHORTENER_NO_UPSCALE: "1"
+          CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "1"
+        run: python process_job.py
