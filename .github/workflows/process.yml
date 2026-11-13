@@ -1,0 +1,225 @@
+name: ClipShortener Processor
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - clipshortener-process
+
+jobs:
+  b2-auth-test:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify B2 credentials
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          key_id = os.environ["B2_KEY_ID"].strip()
+          app_key = os.environ["B2_APPLICATION_KEY"].strip()
+          bucket = os.environ["B2_BUCKET"].strip()
+          encoded = base64.b64encode(f"{key_id}:{app_key}".encode()).decode("ascii")
+          request = urllib.request.Request(
+              "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+              headers={"Authorization": f"Basic {encoded}", "Accept": "application/json"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  data = json.loads(response.read().decode("utf-8"))
+              storage = data["apiInfo"]["storageApi"]
+              visible = any(x.get("name") == bucket for x in storage.get("allowed", {}).get("buckets", []))
+              print("B2_AUTHENTICATION=SUCCESS")
+              print("BUCKET_VISIBLE:", visible)
+              if not visible:
+                  raise SystemExit(f'Bucket "{bucket}" is not visible to this application key.')
+          except urllib.error.HTTPError as error:
+              print("B2_AUTHENTICATION=FAILED")
+              print("HTTP_STATUS:", error.code)
+              print(error.read().decode("utf-8", "replace"))
+              raise
+          PY
+
+  process:
+    if: ${{ github.event_name == 'repository_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out worker
+        uses: actions/checkout@v7
+
+      - name: Set up Python with pip cache
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements-worker.txt
+            requirements-processor.txt
+
+      - name: Install FFmpeg and FFprobe
+        id: install_ffmpeg
+        timeout-minutes: 15
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "FFmpeg and FFprobe are already present on this runner."
+          else
+            echo "FFmpeg is missing; refreshing apt metadata with retry and longer network timeouts."
+            sudo apt-get -o Acquire::ForceIPv4=true \
+              -o Acquire::Retries=5 \
+              -o Acquire::http::Timeout=60 \
+              -o Acquire::https::Timeout=60 \
+              update
+            sudo apt-get -o Acquire::ForceIPv4=true \
+              -o Acquire::Retries=5 \
+              -o Acquire::http::Timeout=60 \
+              -o Acquire::https::Timeout=60 \
+              install -y --no-install-recommends ffmpeg
+          fi
+
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Install Python dependencies
+        id: install_python
+        timeout-minutes: 10
+        env:
+          JOB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+
+          # app.py imports faster-whisper optionally. Only install the large
+          # speech-recognition stack when this job explicitly enables captions.
+          CAPTIONS_ENABLED="$(python - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ.get("JOB_PAYLOAD") or "{}")
+          job = payload.get("job", payload)
+          captions = job.get("captions") if isinstance(job, dict) else None
+          enabled = isinstance(captions, dict) and bool(captions.get("enabled"))
+          print("true" if enabled else "false")
+          PY
+          )"
+
+          if [ "$CAPTIONS_ENABLED" = "true" ]; then
+            echo "CAPTIONS_ENABLED=true; installing the full caption-processing dependencies."
+            REQUIREMENTS_FILE="requirements-worker.txt"
+          else
+            echo "CAPTIONS_ENABLED=false; using the lean processor-only dependency set."
+            REQUIREMENTS_FILE="requirements-processor.txt"
+          fi
+
+          python -m pip install \
+            --disable-pip-version-check \
+            --retries 5 \
+            --timeout 60 \
+            -r "$REQUIREMENTS_FILE"
+
+          python - <<'PY'
+          import fastapi
+          import pydantic
+          import requests
+
+          print("PYTHON_DEPENDENCIES=READY")
+          print("fastapi:", fastapi.__version__)
+          print("pydantic:", pydantic.__version__)
+          print("requests:", requests.__version__)
+          PY
+
+          if [ "$CAPTIONS_ENABLED" = "true" ]; then
+            python -c "from faster_whisper import WhisperModel; print('CAPTION_DEPENDENCIES=READY')"
+          else
+            echo "CAPTION_DEPENDENCIES=SKIPPED (captions disabled for this job)"
+          fi
+
+      - name: Run ClipShortener job
+        id: process_job
+        timeout-minutes: 80
+        env:
+          JOB_ID: ${{ github.event.client_payload.job.id }}
+          JOB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          CONTROL_URL: ${{ secrets.CONTROL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          CLIPSHORTENER_FFMPEG_THREADS: "0"
+          CLIPSHORTENER_FILTER_THREADS: "4"
+          CLIPSHORTENER_FFMPEG_PRESET: "ultrafast"
+          CLIPSHORTENER_FFMPEG_TUNE: ""
+          CLIPSHORTENER_X264_PARAMS: ""
+          CLIPSHORTENER_UPLOAD_FSYNC: "0"
+          CLIPSHORTENER_NO_UPSCALE: "1"
+          CLIPSHORTENER_VALIDATE_OUTPUT_DURATIONS: "1"
+        run: python process_job.py
+
+      - name: Report setup failure to ClipShortener
+        if: ${{ failure() && github.event_name == 'repository_dispatch' && (steps.install_ffmpeg.outcome == 'failure' || steps.install_python.outcome == 'failure') }}
+        env:
+          JOB_ID: ${{ github.event.client_payload.job.id }}
+          CONTROL_URL: ${{ secrets.CONTROL_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          job_id = os.environ.get("JOB_ID", "").strip()
+          base = os.environ.get("CONTROL_URL", "").strip().rstrip("/")
+          secret = os.environ.get("WORKER_SECRET", "").strip()
+          if not job_id or not base or not secret:
+              print("SETUP_FAILURE_CALLBACK=SKIPPED (missing callback configuration)")
+              raise SystemExit(0)
+
+          body = json.dumps({
+              "status": "error",
+              "progress": 0,
+              "message": "Processor setup failed before video processing began. Check the GitHub Actions installation logs, then retry.",
+          }).encode("utf-8")
+          request = urllib.request.Request(
+              f"{base}/api/jobs/{job_id}/worker-status",
+              data=body,
+              method="POST",
+              headers={
+                  "X-Worker-Secret": secret,
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  print("SETUP_FAILURE_CALLBACK=OK", response.status)
+          except urllib.error.HTTPError as error:
+              print("SETUP_FAILURE_CALLBACK=REJECTED", error.code)
+              if error.code == 403:
+                  print("Check that the WORKER_SECRET GitHub Actions secret exactly matches the Cloudflare Worker's WORKER_SECRET setting, and that CONTROL_URL is the correct Worker URL.")
+          except Exception as error:
+              print("SETUP_FAILURE_CALLBACK=UNREACHABLE", type(error).__name__)
+          PY
+
+          {
+            echo "### MicMoment processor setup failed"
+            echo "The processor did not start. Check the FFmpeg and Python dependency installation steps."
+            echo "If the status callback returned HTTP 403, compare the GitHub Actions WORKER_SECRET with the Cloudflare Worker WORKER_SECRET and verify CONTROL_URL."
+          } >> "$GITHUB_STEP_SUMMARY"
