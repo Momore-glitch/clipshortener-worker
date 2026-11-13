@@ -1,0 +1,212 @@
+name: Audit unfinished Backblaze multipart uploads
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_hours:
+        description: "How far back to inspect unfinished uploads"
+        required: true
+        type: choice
+        options:
+          - "24"
+          - "72"
+          - "168"
+        default: "72"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read-only audit of recent unfinished uploads
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          key_id = os.environ["B2_KEY_ID"].strip()
+          app_key = os.environ["B2_APPLICATION_KEY"].strip()
+          bucket_name = os.environ["B2_BUCKET"].strip()
+          hours = int(os.environ.get("LOOKBACK_HOURS", "72"))
+
+          if bucket_name != "clipshortener-media":
+              raise SystemExit(
+                  "Safety stop: configured bucket is not clipshortener-media. "
+                  "Nothing was changed."
+              )
+
+          basic = base64.b64encode(
+              f"{key_id}:{app_key}".encode("utf-8")
+          ).decode("ascii")
+
+          def read_json(request):
+              try:
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      return json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", "replace")
+                  try:
+                      detail = json.loads(body).get("message", "Backblaze request failed")
+                  except Exception:
+                      detail = "Backblaze request failed"
+                  raise RuntimeError(
+                      f"Backblaze HTTP {error.code}: {str(detail)[:250]}"
+                  ) from error
+
+          auth_request = urllib.request.Request(
+              "https://api.backblazeb2.com/b2api/v4/b2_authorize_account",
+              headers={
+                  "Authorization": f"Basic {basic}",
+                  "Accept": "application/json",
+              },
+          )
+          auth = read_json(auth_request)
+          token = auth["authorizationToken"]
+          storage = auth["apiInfo"]["storageApi"]
+          api_url = storage["apiUrl"].rstrip("/")
+
+          bucket = next(
+              (
+                  item for item in storage.get("allowed", {}).get("buckets", [])
+                  if item.get("name") == bucket_name
+              ),
+              None,
+          )
+          if not bucket:
+              raise SystemExit(
+                  "The B2 application key cannot see clipshortener-media. "
+                  "No uploads were changed."
+              )
+
+          cutoff_ms = int((time.time() - hours * 3600) * 1000)
+          unfinished = []
+          start_file_id = None
+
+          while True:
+              params = {
+                  "bucketId": bucket["id"],
+                  "maxFileCount": 100,
+              }
+              if start_file_id:
+                  params["startFileId"] = start_file_id
+
+              url = (
+                  api_url
+                  + "/b2api/v4/b2_list_unfinished_large_files?"
+                  + urllib.parse.urlencode(params)
+              )
+              request = urllib.request.Request(
+                  url,
+                  headers={"Authorization": token, "Accept": "application/json"},
+              )
+              page = read_json(request)
+              unfinished.extend(
+                  item for item in page.get("files", [])
+                  if item.get("action") == "start"
+                  and int(item.get("uploadTimestamp", 0) or 0) >= cutoff_ms
+              )
+
+              next_file_id = page.get("nextFileId")
+              if not next_file_id or next_file_id == start_file_id:
+                  break
+              start_file_id = next_file_id
+
+          unfinished.sort(
+              key=lambda item: int(item.get("uploadTimestamp", 0) or 0),
+              reverse=True,
+          )
+          selected = unfinished[:10]
+
+          print("B2_AUTHENTICATION=SUCCESS")
+          print("BUCKET_VISIBLE=True")
+          print(f"LOOKBACK_HOURS={hours}")
+          print(f"RECENT_UNFINISHED_UPLOADS_FOUND={len(unfinished)}")
+          print(f"AUDIT_RECORDS={len(selected)}")
+
+          if not selected:
+              print(
+                  "NO_RECENT_UNFINISHED_UPLOADS. The failed finish may already "
+                  "have been canceled, completed, or never started."
+              )
+              raise SystemExit(0)
+
+          for index, item in enumerate(selected, start=1):
+              file_id = item.get("fileId")
+              if not file_id:
+                  print(f"AUDIT_{index}_ERROR=Missing file ID in B2 response")
+                  continue
+
+              all_parts = []
+              start_part_number = 1
+
+              while True:
+                  params = {
+                      "fileId": file_id,
+                      "startPartNumber": start_part_number,
+                      "maxPartCount": 1000,
+                  }
+                  url = (
+                      api_url
+                      + "/b2api/v4/b2_list_parts?"
+                      + urllib.parse.urlencode(params)
+                  )
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          "Authorization": token,
+                          "Accept": "application/json",
+                      },
+                  )
+                  part_page = read_json(request)
+                  all_parts.extend(part_page.get("parts", []))
+                  next_part = part_page.get("nextPartNumber")
+                  if not next_part or int(next_part) <= start_part_number:
+                      break
+                  start_part_number = int(next_part)
+
+              numbers = sorted(
+                  int(part["partNumber"])
+                  for part in all_parts
+                  if part.get("partNumber") is not None
+              )
+              ordered_parts = sorted(
+                  all_parts,
+                  key=lambda part: int(part.get("partNumber", 0) or 0),
+              )
+              sizes = [
+                  int(part.get("contentLength", 0) or 0)
+                  for part in ordered_parts
+              ]
+              contiguous = numbers == list(range(1, len(numbers) + 1))
+              nonfinal_sizes = sizes[:-1] if len(sizes) > 1 else []
+              min_nonfinal = min(nonfinal_sizes) if nonfinal_sizes else 0
+              age_minutes = max(
+                  0,
+                  int((time.time() * 1000 - int(item.get("uploadTimestamp", 0))) / 60000),
+              )
+
+              print(f"AUDIT_{index}_AGE_MINUTES={age_minutes}")
+              print(f"AUDIT_{index}_PART_COUNT={len(numbers)}")
+              print(f"AUDIT_{index}_PART_NUMBERS={','.join(map(str, numbers)) or 'none'}")
+              print(f"AUDIT_{index}_PART_SIZES_BYTES={','.join(map(str, sizes)) or 'none'}")
+              print(f"AUDIT_{index}_PART_NUMBERS_CONTIGUOUS={contiguous}")
+              print(f"AUDIT_{index}_MIN_NONFINAL_PART_BYTES={min_nonfinal}")
+              print(f"AUDIT_{index}_TWO_OR_MORE_PARTS={len(numbers) >= 2}")
+
+          print("AUDIT_MODE=READ_ONLY")
+          print("NO_UPLOADS_FINISHED_CANCELLED_OR_DELETED=True")
+          PY
