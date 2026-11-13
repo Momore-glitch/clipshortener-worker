@@ -1,0 +1,7 @@
+# Runtime dependencies for process_job.py and app.py when captions are disabled.
+# faster-whisper is optional in app.py and is installed from requirements-worker.txt
+# only when the incoming job explicitly requests automatic captions.
+fastapi==0.116.1
+python-multipart==0.0.20
+pydantic==2.11.7
+requests==2.32.5
