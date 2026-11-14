@@ -114,9 +114,12 @@ jobs:
                   headers={"Authorization": token, "Accept": "application/json"},
               )
               page = read_json(request)
+              # B2 Native API v4 currently reports action="upload" for
+              # entries returned by b2_list_unfinished_large_files. Accept
+              # the older "start" label too, for compatibility.
               unfinished.extend(
                   item for item in page.get("files", [])
-                  if item.get("action") == "start"
+                  if item.get("action") in ("start", "upload", None)
                   and int(item.get("uploadTimestamp", 0) or 0) >= cutoff_ms
               )
 
@@ -136,6 +139,8 @@ jobs:
           print(f"LOOKBACK_HOURS={hours}")
           print(f"RECENT_UNFINISHED_UPLOADS_FOUND={len(unfinished)}")
           print(f"AUDIT_RECORDS={len(selected)}")
+          action_values = sorted({str(item.get("action", "missing")) for item in unfinished})
+          print("B2_UNFINISHED_ACTION_VALUES=" + (",".join(action_values) or "none"))
 
           if not selected:
               print(
